@@ -1,0 +1,179 @@
+package sqlite;
+
+use ecosystem::sql::{PoolPolicy, Query, Error, ErrorKind, Execution, FromRow, Driver, Connection, Executor};
+
+pub struct PoolStats {
+    pub open: isize,
+    pub idle: isize,
+    pub in_use: isize,
+    pub closed: bool,
+}
+
+pub struct SqlitePool {
+    driver: SqliteDriver,
+    dsn: string,
+    policy: PoolPolicy,
+    idle: Vec[SqliteConnection],
+    opened: Ref[isize],
+    closed: Ref[bool],
+}
+
+impl SqlitePool {
+    pub fn new(driver: SqliteDriver, dsn: string, policy: PoolPolicy) -> Result[SqlitePool, Error] {
+        policy.validate()?;
+        if dsn == "" {
+            return Result::Err(Error::new(ErrorKind::Argument, "empty SQL data source"))
+        }
+        Result::Ok(
+            SqlitePool {
+                driver,
+                dsn,
+                policy,
+                idle: Vec::new(),
+                opened: Ref::new(0),
+                closed: Ref::new(false),
+            },
+        )
+    }
+
+    pub fn policy(self: SqlitePool) -> PoolPolicy {
+        self.policy
+    }
+
+    pub fn stats(self: SqlitePool) -> PoolStats {
+        PoolStats {
+            open: self.opened.get(),
+            idle: self.idle.len(),
+            in_use: self.opened.get() - self.idle.len(),
+            closed: self.closed.get(),
+        }
+    }
+
+    fn acquire(self: SqlitePool) -> Result[SqliteConnection, Error] {
+        if self.closed.get() {
+            return Result::Err(Error::new(ErrorKind::Closed, "SQL pool is closed"))
+        }
+        if let Some(connection) = self.idle.pop() {
+            return Result::Ok(connection.leased())
+        }
+        if self.opened.get() >= self.policy.max_open {
+            return Result::Err(Error::new(ErrorKind::Busy, "SQL pool is at max_open"))
+        }
+        let connection = self.driver.connect(self.dsn)?;
+        self.opened.set(self.opened.get() + 1);
+        Result::Ok(connection.leased())
+    }
+
+    fn release(self: SqlitePool, connection: SqliteConnection) -> Result[(), Error] {
+        connection.expire_lease();
+        if connection.database.is_closed() {
+            return self.discard(
+                connection,
+                Error::new(ErrorKind::Closed, "SQL pooled connection was closed by lease"),
+            )
+        }
+        let resources = connection.database.resources();
+        if resources.statements != 0 || resources.cursors != 0 || resources.transactions != 0 {
+            return self.discard(
+                connection,
+                Error::new(
+                    ErrorKind::Argument,
+                    "SQL pooled connection returned with live resources: statements="
+                        + resources.statements.to_string()
+                        + ", cursors="
+                        + resources.cursors.to_string()
+                        + ", transactions="
+                        + resources.transactions.to_string(),
+                ),
+            )
+        }
+        if !self.closed.get() && self.idle.len() < self.policy.max_idle {
+            self.idle.push(connection.unleased());
+            return Result::Ok(())
+        }
+        let result = connection.database.close().map_err(convert_error);
+        self.opened.set(self.opened.get() - 1);
+        result
+    }
+
+    fn discard(self: SqlitePool, connection: SqliteConnection, reason: Error) -> Result[(), Error] {
+        let cleanup = connection.database.close().map_err(convert_error);
+        self.opened.set(self.opened.get() - 1);
+        match cleanup {
+            Ok(_) => Result::Err(reason),
+            Err(error) => Result::Err(
+                Error {
+                    kind: reason.kind,
+                    message: reason.message + "; connection close failed",
+                    source: Option::Some(error.to_string()),
+                },
+            ),
+        }
+    }
+
+    pub fn with_connection[T](self: SqlitePool, callback: (SqliteConnection) -> Result[T, Error]) -> Result[
+        T,
+        Error,
+    ] {
+        let connection = self.acquire()?;
+        let released = Ref::new(false);
+        defer {
+            if !released.get() {
+                let _ = self.release(connection);
+            }
+        };
+        let result = callback(connection);
+        released.set(true);
+        let cleanup = self.release(connection);
+        match result {
+            Ok(value) => {
+                cleanup?;
+                Result::Ok(value)
+            },
+            Err(error) => match cleanup {
+                Ok(_) => Result::Err(error),
+                Err(cleanup_error) => Result::Err(
+                    Error {
+                        kind: error.kind,
+                        message: error.message + "; cleanup: " + cleanup_error.to_string(),
+                        source: error.source,
+                    },
+                ),
+            },
+        }
+    }
+
+    pub fn execute(self: SqlitePool, query: Query) -> Result[Execution, Error] {
+        self.with_connection(|connection| connection.execute(query))
+    }
+
+    pub fn query_all[T: FromRow](self: SqlitePool, query: Query) -> Result[Vec[T], Error] {
+        let max_rows = self.policy.max_result_rows;
+        self.with_connection(|connection| connection.query_all(query, max_rows))
+    }
+
+    pub fn query_optional[T: FromRow](self: SqlitePool, query: Query) -> Result[Option[T], Error] {
+        self.with_connection(|connection| connection.query_optional(query))
+    }
+
+    pub fn query_one[T: FromRow](self: SqlitePool, query: Query) -> Result[T, Error] {
+        self.with_connection(|connection| connection.query_one(query))
+    }
+
+    pub fn close(self: SqlitePool) -> Result[(), Error] {
+        self.closed.set(true);
+        let mut failure: Option[Error] = Option::None;
+        while let Some(connection) = self.idle.pop() {
+            if let Err(error) = connection.close() {
+                if failure.is_none() {
+                    failure = Option::Some(error);
+                }
+            }
+            self.opened.set(self.opened.get() - 1);
+        }
+        match failure {
+            Some(error) => Result::Err(error),
+            None => Result::Ok(()),
+        }
+    }
+}

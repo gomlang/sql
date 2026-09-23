@@ -1,0 +1,242 @@
+package sqlite;
+
+use ecosystem::sql;
+use ecosystem::sql::{Value, Params, Query, Row, Column, Error, ErrorKind, TransactionMode, Execution};
+use ecosystem::sqlite as native;
+
+pub struct SqliteDriver {}
+
+pub struct SqliteConnection {
+    database: native::Database,
+    lease_active: Option[Ref[bool]],
+}
+
+pub struct SqliteTransaction {
+    transaction: native::Transaction,
+}
+
+pub struct SqliteRows {
+    rows: native::Rows,
+}
+
+impl SqliteConnection {
+    fn leased(self: SqliteConnection) -> SqliteConnection {
+        SqliteConnection { database: self.database, lease_active: Option::Some(Ref::new(true)) }
+    }
+
+    fn unleased(self: SqliteConnection) -> SqliteConnection {
+        SqliteConnection { database: self.database, lease_active: Option::None }
+    }
+
+    fn expire_lease(self: SqliteConnection) -> () {
+        if let Some(active) = self.lease_active {
+            active.set(false);
+        }
+    }
+
+    fn require_active_lease(self: SqliteConnection) -> Result[(), Error] {
+        if let Some(active) = self.lease_active {
+            if !active.get() {
+                return Result::Err(Error::new(ErrorKind::Closed, "SQL connection lease has ended"))
+            }
+        }
+        Result::Ok(())
+    }
+}
+
+fn convert_error(error: native::DbError) -> Error {
+    let kind = match error.kind {
+        native::ErrorKind::Closed => ErrorKind::Closed,
+        native::ErrorKind::Busy => ErrorKind::Busy,
+        native::ErrorKind::Argument => ErrorKind::Argument,
+        native::ErrorKind::Conversion => ErrorKind::Conversion,
+        native::ErrorKind::Timeout => ErrorKind::Timeout,
+        native::ErrorKind::Cancelled => ErrorKind::Cancelled,
+        native::ErrorKind::NoRows => ErrorKind::NoRows,
+        native::ErrorKind::MultipleRows => ErrorKind::MultipleRows,
+        native::ErrorKind::Limit => ErrorKind::Limit,
+        _ => ErrorKind::Backend,
+    };
+    Error { kind, message: "SQLite operation failed", source: Option::Some(error.to_string()) }
+}
+
+fn native_value(value: Value) -> native::Value {
+    match value {
+        Value::Null => native::Value::Null,
+        Value::Integer(number) => native::Value::Integer(number),
+        Value::Real(number) => native::Value::Real(number),
+        Value::Text(text) => native::Value::Text(text),
+        Value::TextBytes(data) => native::Value::TextBytes(data.copy()),
+        Value::Blob(data) => native::Value::Blob(data.copy()),
+    }
+}
+
+fn sql_value(value: native::Value) -> Value {
+    match value {
+        native::Value::Null => Value::Null,
+        native::Value::Integer(number) => Value::Integer(number),
+        native::Value::Real(number) => Value::Real(number),
+        native::Value::Text(text) => Value::Text(text),
+        native::Value::TextBytes(data) => Value::TextBytes(data.copy()),
+        native::Value::Blob(data) => Value::Blob(data.copy()),
+    }
+}
+
+fn native_params(params: Params) -> native::Params {
+    match params {
+        Params::Positional(values) => {
+            let result: Vec[native::Value] = Vec::with_capacity(values.len());
+            for value in values {
+                result.push(native_value(value));
+            }
+            native::Params::positional(result)
+        },
+        Params::Named(values) => {
+            let result: Vec[(string, native::Value)] = Vec::with_capacity(values.len());
+            for (name, value) in values {
+                result.push((name, native_value(value)));
+            }
+            native::Params::named(result)
+        },
+    }
+}
+
+fn sql_row(row: native::Row) -> Result[Row, Error] {
+    let columns: Vec[Column] = Vec::with_capacity(row.len());
+    for column in row.columns() {
+        columns.push(Column { name: column.name, declared_type: column.declared_type });
+    }
+    let values: Vec[Value] = Vec::with_capacity(row.len());
+    for value in row.values() {
+        values.push(sql_value(value));
+    }
+    Row::new(columns, values)
+}
+
+impl SqliteDriver {
+    pub fn new() -> SqliteDriver {
+        SqliteDriver {}
+    }
+
+    pub fn memory(self: SqliteDriver) -> Result[SqliteConnection, Error] {
+        Result::Ok(
+            SqliteConnection {
+                database: native::Database::memory().map_err(convert_error)?,
+                lease_active: Option::None,
+            },
+        )
+    }
+}
+
+impl sql::Driver for SqliteDriver {
+    type Connection = SqliteConnection;
+
+    fn connect(self: SqliteDriver, dsn: string) -> Result[SqliteConnection, Error] {
+        Result::Ok(
+            SqliteConnection {
+                database: native::Database::open(dsn).map_err(convert_error)?,
+                lease_active: Option::None,
+            },
+        )
+    }
+}
+
+impl sql::RowCursor for SqliteRows {
+    fn next(self: SqliteRows) -> Result[Option[Row], Error] {
+        match self.rows.next().map_err(convert_error)? {
+            Some(row) => Result::Ok(Option::Some(sql_row(row)?)),
+            None => Result::Ok(Option::None),
+        }
+    }
+
+    fn close(self: SqliteRows) -> Result[(), Error] {
+        self.rows.close().map_err(convert_error)
+    }
+}
+
+impl sql::Executor for SqliteConnection {
+    type Cursor = SqliteRows;
+
+    fn execute(self: SqliteConnection, query: Query) -> Result[Execution, Error] {
+        self.require_active_lease()?;
+        let result = native::Executor::execute(
+            self.database,
+            query.statement(),
+            native_params(query.params()),
+        ).map_err(convert_error)?;
+        Result::Ok(
+            Execution { rows_affected: result.rows_affected, last_insert_id: result.last_insert_id },
+        )
+    }
+
+    fn query(self: SqliteConnection, query: Query) -> Result[SqliteRows, Error] {
+        self.require_active_lease()?;
+        Result::Ok(
+            SqliteRows {
+                rows: native::Executor::query(
+                    self.database,
+                    query.statement(),
+                    native_params(query.params()),
+                ).map_err(convert_error)?,
+            },
+        )
+    }
+}
+
+impl sql::Executor for SqliteTransaction {
+    type Cursor = SqliteRows;
+
+    fn execute(self: SqliteTransaction, query: Query) -> Result[Execution, Error] {
+        let result = native::Executor::execute(
+            self.transaction,
+            query.statement(),
+            native_params(query.params()),
+        ).map_err(convert_error)?;
+        Result::Ok(
+            Execution { rows_affected: result.rows_affected, last_insert_id: result.last_insert_id },
+        )
+    }
+
+    fn query(self: SqliteTransaction, query: Query) -> Result[SqliteRows, Error] {
+        Result::Ok(
+            SqliteRows {
+                rows: native::Executor::query(
+                    self.transaction,
+                    query.statement(),
+                    native_params(query.params()),
+                ).map_err(convert_error)?,
+            },
+        )
+    }
+}
+
+impl sql::Connection for SqliteConnection {
+    type Tx = SqliteTransaction;
+
+    fn begin(self: SqliteConnection, mode: TransactionMode) -> Result[SqliteTransaction, Error] {
+        self.require_active_lease()?;
+        let mode = match mode {
+            TransactionMode::Deferred => native::TransactionMode::Deferred,
+            TransactionMode::Immediate => native::TransactionMode::Immediate,
+            TransactionMode::Exclusive => native::TransactionMode::Exclusive,
+        };
+        Result::Ok(
+            SqliteTransaction { transaction: self.database.begin(mode).map_err(convert_error)? },
+        )
+    }
+
+    fn close(self: SqliteConnection) -> Result[(), Error] {
+        self.require_active_lease()?;
+        self.database.close().map_err(convert_error)
+    }
+}
+
+impl sql::Transaction for SqliteTransaction {
+    fn commit(self: SqliteTransaction) -> Result[(), Error] {
+        self.transaction.commit().map_err(convert_error)
+    }
+
+    fn rollback(self: SqliteTransaction) -> Result[(), Error] {
+        self.transaction.rollback().map_err(convert_error)
+    }
+}

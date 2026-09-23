@@ -1,0 +1,440 @@
+package sql;
+
+use std::bytes::{Bytes};
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    Argument,
+    Conversion,
+    Limit,
+    Closed,
+    Busy,
+    Cancelled,
+    Timeout,
+    NoRows,
+    MultipleRows,
+    Backend,
+}
+
+pub struct Error {
+    pub kind: ErrorKind,
+    pub message: string,
+    pub source: Option[string],
+}
+
+impl Error {
+    pub fn new(kind: ErrorKind, message: string) -> Error {
+        Error { kind, message, source: Option::None }
+    }
+}
+
+impl ToString for Error {
+    fn to_string(self: Error) -> string {
+        match self.source {
+            Some(source) => self.message + ": " + source,
+            None => self.message,
+        }
+    }
+}
+
+impl Debug for Error {
+    fn debug(self: Error) -> string {
+        self.to_string()
+    }
+}
+
+pub enum Value {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(string),
+    TextBytes(Bytes),
+    Blob(Bytes),
+}
+
+impl Value {
+    pub fn is_null(self: Value) -> bool {
+        match self {
+            Value::Null => true,
+            _ => false,
+        }
+    }
+}
+
+fn copy_value(value: Value) -> Value {
+    match value {
+        Value::TextBytes(data) => Value::TextBytes(data.copy()),
+        Value::Blob(data) => Value::Blob(data.copy()),
+        _ => value,
+    }
+}
+
+fn copy_values(values: Vec[Value]) -> Vec[Value] {
+    let snapshot: Vec[Value] = Vec::with_capacity(values.len());
+    for value in values {
+        snapshot.push(copy_value(value));
+    }
+    snapshot
+}
+
+pub trait ToValue {
+    fn to_value(self: Self) -> Value;
+}
+
+pub trait FromValue {
+    fn from_value(value: Value) -> Result[Self, Error];
+}
+
+impl ToValue for Value {
+    fn to_value(self: Value) -> Value {
+        self
+    }
+}
+
+impl FromValue for Value {
+    fn from_value(value: Value) -> Result[Value, Error] {
+        Result::Ok(value)
+    }
+}
+
+impl ToValue for i64 {
+    fn to_value(self: i64) -> Value {
+        Value::Integer(self)
+    }
+}
+
+impl FromValue for i64 {
+    fn from_value(value: Value) -> Result[i64, Error] {
+        match value {
+            Value::Integer(number) => Result::Ok(number),
+            _ => Result::Err(Error::new(ErrorKind::Conversion, "expected INTEGER")),
+        }
+    }
+}
+
+impl ToValue for f64 {
+    fn to_value(self: f64) -> Value {
+        Value::Real(self)
+    }
+}
+
+impl FromValue for f64 {
+    fn from_value(value: Value) -> Result[f64, Error] {
+        match value {
+            Value::Real(number) => Result::Ok(number),
+            _ => Result::Err(Error::new(ErrorKind::Conversion, "expected REAL")),
+        }
+    }
+}
+
+impl ToValue for bool {
+    fn to_value(self: bool) -> Value {
+        Value::Integer(
+            if self {
+                1
+            } else {
+                0
+            },
+        )
+    }
+}
+
+impl FromValue for bool {
+    fn from_value(value: Value) -> Result[bool, Error] {
+        match value {
+            Value::Integer(0) => Result::Ok(false),
+            Value::Integer(1) => Result::Ok(true),
+            _ => Result::Err(Error::new(ErrorKind::Conversion, "expected INTEGER 0 or 1")),
+        }
+    }
+}
+
+impl ToValue for string {
+    fn to_value(self: string) -> Value {
+        Value::Text(self)
+    }
+}
+
+impl FromValue for string {
+    fn from_value(value: Value) -> Result[string, Error] {
+        match value {
+            Value::Text(text) => Result::Ok(text),
+            _ => Result::Err(Error::new(ErrorKind::Conversion, "expected UTF-8 TEXT")),
+        }
+    }
+}
+
+impl ToValue for Bytes {
+    fn to_value(self: Bytes) -> Value {
+        Value::Blob(self.copy())
+    }
+}
+
+impl FromValue for Bytes {
+    fn from_value(value: Value) -> Result[Bytes, Error] {
+        match value {
+            Value::Blob(data) => Result::Ok(data.copy()),
+            _ => Result::Err(Error::new(ErrorKind::Conversion, "expected BLOB")),
+        }
+    }
+}
+
+impl[T: ToValue] ToValue for Option[T] {
+    fn to_value(self: Option[T]) -> Value {
+        match self {
+            Some(value) => value.to_value(),
+            None => Value::Null,
+        }
+    }
+}
+
+impl[T: FromValue] FromValue for Option[T] {
+    fn from_value(value: Value) -> Result[Option[T], Error] {
+        if value.is_null() {
+            Result::Ok(Option::None)
+        } else {
+            Result::Ok(Option::Some(FromValue::from_value(value)?))
+        }
+    }
+}
+
+pub enum Params {
+    Positional(Vec[Value]),
+    Named(Vec[(string, Value)]),
+}
+
+impl Params {
+    pub fn empty() -> Params {
+        Params::Positional(Vec::new())
+    }
+
+    pub fn positional(values: Vec[Value]) -> Params {
+        Params::Positional(copy_values(values))
+    }
+
+    pub fn named(values: Vec[(string, Value)]) -> Params {
+        let snapshot: Vec[(string, Value)] = Vec::with_capacity(values.len());
+        for (name, value) in values {
+            snapshot.push((name, copy_value(value)));
+        }
+        Params::Named(snapshot)
+    }
+}
+
+fn copy_params(params: Params) -> Params {
+    match params {
+        Params::Positional(values) => Params::positional(values),
+        Params::Named(values) => Params::named(values),
+    }
+}
+
+pub struct Query {
+    statement: string,
+    params: Params,
+}
+
+impl Query {
+    pub fn new(statement: string, params: Params) -> Result[Query, Error] {
+        if statement.byte_len() == 0 || statement.byte_len() > 1048576 {
+            return Result::Err(
+                Error::new(
+                    ErrorKind::Argument,
+                    "SQL statement must contain 1 through 1048576 bytes",
+                ),
+            )
+        }
+        Result::Ok(Query { statement, params: copy_params(params) })
+    }
+
+    pub fn statement(self: Query) -> string {
+        self.statement
+    }
+
+    pub fn params(self: Query) -> Params {
+        copy_params(self.params)
+    }
+}
+
+pub struct Execution {
+    pub rows_affected: i64,
+    pub last_insert_id: i64,
+}
+
+pub struct Column {
+    pub name: string,
+    pub declared_type: string,
+}
+
+pub struct Row {
+    columns: Vec[Column],
+    values: Vec[Value],
+}
+
+impl Row {
+    pub fn new(columns: Vec[Column], values: Vec[Value]) -> Result[Row, Error] {
+        if columns.len() != values.len() {
+            return Result::Err(Error::new(ErrorKind::Argument, "column/value count mismatch"))
+        }
+        Result::Ok(Row { columns: columns.copy(), values: copy_values(values) })
+    }
+
+    pub fn len(self: Row) -> isize {
+        self.values.len()
+    }
+
+    pub fn columns(self: Row) -> Vec[Column] {
+        self.columns.copy()
+    }
+
+    pub fn values(self: Row) -> Vec[Value] {
+        copy_values(self.values)
+    }
+
+    pub fn value(self: Row, index: isize) -> Result[Value, Error] {
+        if index < 0 || index >= self.values.len() {
+            Result::Err(Error::new(ErrorKind::Argument, "column index out of range"))
+        } else {
+            Result::Ok(copy_value(self.values[index]))
+        }
+    }
+
+    pub fn index(self: Row, name: string) -> Result[isize, Error] {
+        let mut result = Option::None;
+        for index in 0..self.columns.len() {
+            if self.columns[index].name == name {
+                if result.is_some() {
+                    return Result::Err(
+                        Error::new(ErrorKind::Argument, "ambiguous column name: " + name),
+                    )
+                }
+                result = Option::Some(index);
+            }
+        }
+        result.ok_or(Error::new(ErrorKind::Argument, "unknown column name: " + name))
+    }
+
+    pub fn get[T: FromValue](self: Row, index: isize) -> Result[T, Error] {
+        FromValue::from_value(self.value(index)?)
+    }
+
+    pub fn get_named[T: FromValue](self: Row, name: string) -> Result[T, Error] {
+        self.get(self.index(name)?)
+    }
+}
+
+pub trait FromRow {
+    fn from_row(row: Row) -> Result[Self, Error];
+}
+
+impl FromRow for Row {
+    fn from_row(row: Row) -> Result[Row, Error] {
+        Result::Ok(row)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TransactionMode {
+    Deferred,
+    Immediate,
+    Exclusive,
+}
+
+pub trait RowCursor {
+    fn next(self: Self) -> Result[Option[Row], Error];
+    fn close(self: Self) -> Result[(), Error];
+}
+
+pub trait Executor {
+    type Cursor: RowCursor;
+    fn execute(self: Self, query: Query) -> Result[Execution, Error];
+    fn query(self: Self, query: Query) -> Result[Self::Cursor, Error];
+    fn query_all[T: FromRow](self: Self, query: Query, max_rows: isize) -> Result[Vec[T], Error] {
+        if max_rows < 0 || max_rows > 1048576 {
+            return Result::Err(Error::new(ErrorKind::Limit, "invalid result row limit"))
+        }
+        let rows = self.query(query)?;
+        let closed = Ref::new(false);
+        defer {
+            if !closed.get() {
+                let _ = rows.close();
+            }
+        };
+        let result: Vec[T] = Vec::new();
+        loop {
+            let Some(row) = rows.next()? else {
+                break
+            };
+            if result.len() >= max_rows {
+                return Result::Err(Error::new(ErrorKind::Limit, "query result exceeds row limit"))
+            }
+            result.push(FromRow::from_row(row)?);
+        }
+        closed.set(true);
+        rows.close()?;
+        Result::Ok(result)
+    }
+    fn query_optional[T: FromRow](self: Self, query: Query) -> Result[Option[T], Error] {
+        let rows = self.query(query)?;
+        let closed = Ref::new(false);
+        defer {
+            if !closed.get() {
+                let _ = rows.close();
+            }
+        };
+        let Some(first) = rows.next()? else {
+            closed.set(true);
+            rows.close()?;
+            return Result::Ok(Option::None)
+        };
+        if rows.next()?.is_some() {
+            return Result::Err(
+                Error::new(ErrorKind::MultipleRows, "expected at most one result row"),
+            )
+        }
+        closed.set(true);
+        rows.close()?;
+        Result::Ok(Option::Some(FromRow::from_row(first)?))
+    }
+    fn query_one[T: FromRow](self: Self, query: Query) -> Result[T, Error] {
+        self.query_optional(query)?.ok_or(Error::new(ErrorKind::NoRows, "query returned no rows"))
+    }
+}
+
+pub trait Transaction: Executor {
+    fn commit(self: Self) -> Result[(), Error];
+    fn rollback(self: Self) -> Result[(), Error];
+}
+
+pub trait Connection: Executor {
+    type Tx: Transaction;
+    fn begin(self: Self, mode: TransactionMode) -> Result[Self::Tx, Error];
+    fn close(self: Self) -> Result[(), Error];
+}
+
+pub trait Driver {
+    type Connection: Connection;
+    fn connect(self: Self, dsn: string) -> Result[Self::Connection, Error];
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct PoolPolicy {
+    pub max_open: isize,
+    pub max_idle: isize,
+    pub max_result_rows: isize,
+}
+
+impl PoolPolicy {
+    pub fn standard() -> PoolPolicy {
+        PoolPolicy { max_open: 1, max_idle: 1, max_result_rows: 10000 }
+    }
+
+    pub fn validate(self: PoolPolicy) -> Result[(), Error] {
+        if self.max_open < 1 || self.max_open > 64 || self.max_idle < 0
+            || self.max_idle > self.max_open
+            || self.max_result_rows < 0
+            || self.max_result_rows > 1048576 {
+            return Result::Err(Error::new(ErrorKind::Argument, "invalid SQL pool policy"))
+        }
+        Result::Ok(())
+    }
+}
