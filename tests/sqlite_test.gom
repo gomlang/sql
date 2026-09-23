@@ -1,0 +1,92 @@
+package tests;
+
+use ecosystem::sql::{Query, Params, Value, Row, FromRow, Error, ErrorKind, Executor, Connection, Transaction, TransactionMode};
+use ecosystem::sql::sqlite::{SqliteDriver};
+use std::testing;
+
+fn query(statement: string, params: Params) -> Query {
+    testing::expect_ok(Query::new(statement, params), "query")
+}
+
+struct Person {
+    id: i64,
+    name: string,
+}
+
+impl FromRow for Person {
+    fn from_row(row: Row) -> Result[Person, Error] {
+        Result::Ok(Person { id: row.get_named("id")?, name: row.get_named("name")? })
+    }
+}
+
+#[test]
+fn sqlite_adapter_binds_rows_and_commits_transactions() -> () {
+    let database = testing::expect_ok(SqliteDriver::new().memory(), "connect");
+    defer {
+        let _ = database.close();
+    };
+    testing::assert_ok(
+        database.execute(query("CREATE TABLE people(id INTEGER, name TEXT)", Params::empty())),
+    );
+    let transaction = testing::expect_ok(database.begin(TransactionMode::Immediate), "begin");
+    let result = testing::expect_ok(
+        transaction.execute(
+            query(
+                "INSERT INTO people VALUES(:id,:name)",
+                Params::named(
+                    Vec::from_array([("id", Value::Integer(7)), ("name", Value::Text("Ada"))]),
+                ),
+            ),
+        ),
+        "insert",
+    );
+    testing::assert_eq(result.rows_affected, 1);
+    testing::assert_ok(transaction.commit());
+    let people: Vec[Person] = testing::expect_ok(
+        database.query_all(query("SELECT id,name FROM people", Params::empty()), 2),
+        "typed rows",
+    );
+    testing::assert_eq(people.len(), 1);
+    testing::assert_eq(people[0].id, 7);
+    testing::assert_eq(people[0].name, "Ada");
+    let single: Person = testing::expect_ok(
+        database.query_one(query("SELECT id,name FROM people", Params::empty())),
+        "one",
+    );
+    testing::assert_eq(single.id, 7);
+    let missing: Result[Person, Error] = database.query_one(
+        query("SELECT id,name FROM people WHERE id=8", Params::empty()),
+    );
+    testing::assert_eq(testing::expect_err(missing, "missing").kind, ErrorKind::NoRows);
+    let too_many: Result[Vec[Person], Error] = database.query_all(
+        query("SELECT id,name FROM people", Params::empty()),
+        0,
+    );
+    testing::assert_eq(testing::expect_err(too_many, "limit").kind, ErrorKind::Limit);
+    testing::assert_ok(database.close());
+}
+
+#[test]
+fn sqlite_adapter_rolls_back_and_maps_errors() -> () {
+    let database = testing::expect_ok(SqliteDriver::new().memory(), "connect");
+    defer {
+        let _ = database.close();
+    };
+    testing::assert_ok(database.execute(query("CREATE TABLE t(v INTEGER UNIQUE)", Params::empty())));
+    let transaction = testing::expect_ok(database.begin(TransactionMode::Deferred), "begin");
+    testing::assert_ok(transaction.execute(query("INSERT INTO t VALUES(1)", Params::empty())));
+    testing::assert_ok(transaction.rollback());
+    let row: Row = testing::expect_ok(
+        database.query_one(query("SELECT count(*) FROM t", Params::empty())),
+        "count",
+    );
+    let count: i64 = testing::expect_ok(row.get(0), "count value");
+    testing::assert_eq(count, 0);
+    let error = testing::expect_err(
+        database.execute(query("INVALID SQL", Params::empty())),
+        "backend error",
+    );
+    testing::assert_eq(error.kind, ErrorKind::Backend);
+    testing::assert(error.source.is_some());
+    testing::assert_ok(database.close());
+}

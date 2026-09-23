@@ -1,0 +1,225 @@
+package tests;
+
+use ecosystem::sql::{PoolPolicy, Query, Params, Row, Error, ErrorKind, Executor, Connection, TransactionMode};
+use ecosystem::sql::sqlite::{SqliteDriver, SqlitePool, SqliteConnection};
+use std::testing;
+
+fn pool_query(statement: string) -> Query {
+    testing::expect_ok(Query::new(statement, Params::empty()), "query")
+}
+
+#[test]
+fn pool_enforces_open_limit_and_reuses_idle_sqlite_connection() -> () {
+    let pool = testing::expect_ok(
+        SqlitePool::new(SqliteDriver::new(), ":memory:", PoolPolicy::standard()),
+        "pool",
+    );
+    testing::assert_eq(pool.stats().open, 0);
+    testing::assert_ok(
+        pool.with_connection(
+            |connection| {
+                connection.execute(pool_query("CREATE TABLE retained(v INTEGER)"))?;
+                let busy: Result[(), Error] = pool.with_connection(|_| Result::Ok(()));
+                testing::assert_eq(testing::expect_err(busy, "at max_open").kind, ErrorKind::Busy);
+                testing::assert_eq(pool.stats().in_use, 1);
+                Result::Ok(())
+            },
+        ),
+    );
+    testing::assert_eq(pool.stats().open, 1);
+    testing::assert_eq(pool.stats().idle, 1);
+    let row: Row = testing::expect_ok(
+        pool.query_one(pool_query("SELECT count(*) FROM sqlite_master WHERE name='retained'")),
+        "reused connection",
+    );
+    let count: i64 = testing::expect_ok(row.get(0), "table count");
+    testing::assert_eq(count, 1);
+    testing::assert_ok(pool.close());
+    testing::assert_eq(pool.stats().open, 0);
+    testing::assert(pool.stats().closed);
+    let closed: Result[(), Error] = pool.with_connection(|_| Result::Ok(()));
+    testing::assert_eq(testing::expect_err(closed, "closed pool").kind, ErrorKind::Closed);
+}
+
+#[test]
+fn pool_evicts_idle_connections_and_caps_retained_rows() -> () {
+    let policy = PoolPolicy { max_open: 2, max_idle: 0, max_result_rows: 1 };
+    let pool = testing::expect_ok(SqlitePool::new(SqliteDriver::new(), ":memory:", policy), "pool");
+    testing::assert_ok(
+        pool.with_connection(
+            |first| {
+                first.execute(pool_query("CREATE TABLE ephemeral(v INTEGER)"))?;
+                pool.with_connection(
+                    |second| {
+                        second.execute(pool_query("CREATE TABLE other(v INTEGER)"))?;
+                        testing::assert_eq(pool.stats().open, 2);
+                        testing::assert_eq(pool.stats().in_use, 2);
+                        Result::Ok(())
+                    },
+                )?;
+                Result::Ok(())
+            },
+        ),
+    );
+    testing::assert_eq(pool.stats().open, 0);
+    testing::assert_eq(pool.stats().idle, 0);
+    let count: Row = testing::expect_ok(
+        pool.query_one(pool_query("SELECT count(*) FROM sqlite_master WHERE name='ephemeral'")),
+        "fresh connection",
+    );
+    let absent: i64 = testing::expect_ok(count.get(0), "count");
+    testing::assert_eq(absent, 0);
+    let limited: Result[Vec[Row], Error] = pool.query_all(pool_query("SELECT 1 UNION ALL SELECT 2"));
+    testing::assert_eq(testing::expect_err(limited, "row cap").kind, ErrorKind::Limit);
+    testing::assert_eq(pool.stats().open, 0);
+    testing::assert_ok(pool.close());
+}
+
+#[test]
+fn closing_pool_waits_for_active_lease_return_without_reuse() -> () {
+    let pool = testing::expect_ok(
+        SqlitePool::new(SqliteDriver::new(), ":memory:", PoolPolicy::standard()),
+        "pool",
+    );
+    testing::assert_ok(
+        pool.with_connection(
+            |_| {
+                testing::assert_eq(pool.stats().open, 1);
+                testing::assert_ok(pool.close());
+                testing::assert(pool.stats().closed);
+                testing::assert_eq(pool.stats().in_use, 1);
+                Result::Ok(())
+            },
+        ),
+    );
+    testing::assert_eq(pool.stats().open, 0);
+    testing::assert_eq(pool.stats().idle, 0);
+    testing::assert_ok(pool.close());
+}
+
+#[test]
+fn pool_discards_connection_with_uncommitted_transaction() -> () {
+    let pool = testing::expect_ok(
+        SqlitePool::new(SqliteDriver::new(), ":memory:", PoolPolicy::standard()),
+        "pool",
+    );
+    let dirty: Result[(), Error] = pool.with_connection(
+        |connection| {
+            connection.execute(pool_query("CREATE TABLE pending(v INTEGER)"))?;
+            let transaction = connection.begin(TransactionMode::Immediate)?;
+            transaction.execute(pool_query("INSERT INTO pending VALUES(1)"))?;
+            Result::Ok(())
+        },
+    );
+    let error = testing::expect_err(dirty, "uncommitted transaction");
+    testing::assert_eq(error.kind, ErrorKind::Argument);
+    testing::assert_eq(
+        error.message,
+        "SQL pooled connection returned with live resources: statements=0, cursors=0, transactions=1",
+    );
+    testing::assert_eq(pool.stats().open, 0);
+    testing::assert_eq(pool.stats().idle, 0);
+    let fresh: Row = testing::expect_ok(
+        pool.query_one(pool_query("SELECT count(*) FROM sqlite_master WHERE name='pending'")),
+        "fresh connection",
+    );
+    let table_count: i64 = testing::expect_ok(fresh.get(0), "table count");
+    testing::assert_eq(table_count, 0);
+    testing::assert_ok(pool.close());
+}
+
+#[test]
+fn pool_discards_connection_with_unclosed_cursor() -> () {
+    let pool = testing::expect_ok(
+        SqlitePool::new(SqliteDriver::new(), ":memory:", PoolPolicy::standard()),
+        "pool",
+    );
+    let dirty: Result[(), Error] = pool.with_connection(
+        |connection| {
+            let _cursor = connection.query(pool_query("SELECT 1"))?;
+            Result::Ok(())
+        },
+    );
+    let error = testing::expect_err(dirty, "unclosed cursor");
+    testing::assert_eq(error.kind, ErrorKind::Argument);
+    testing::assert_eq(
+        error.message,
+        "SQL pooled connection returned with live resources: statements=0, cursors=1, transactions=0",
+    );
+    testing::assert_eq(pool.stats().open, 0);
+    testing::assert_eq(pool.stats().idle, 0);
+    testing::assert_ok(pool.execute(pool_query("CREATE TABLE after_cursor(v INTEGER)")));
+    testing::assert_ok(pool.close());
+}
+
+#[test]
+fn pool_discards_connection_closed_by_callback() -> () {
+    let pool = testing::expect_ok(
+        SqlitePool::new(SqliteDriver::new(), ":memory:", PoolPolicy::standard()),
+        "pool",
+    );
+    let closed: Result[(), Error] = pool.with_connection(
+        |connection| {
+            connection.close()?;
+            Result::Ok(())
+        },
+    );
+    let error = testing::expect_err(closed, "closed by callback");
+    testing::assert_eq(error.kind, ErrorKind::Closed);
+    testing::assert_eq(error.message, "SQL pooled connection was closed by lease");
+    testing::assert_eq(pool.stats().open, 0);
+    testing::assert_eq(pool.stats().idle, 0);
+    testing::assert_ok(pool.execute(pool_query("CREATE TABLE after_close(v INTEGER)")));
+    testing::assert_ok(pool.close());
+}
+
+#[test]
+fn retained_connection_alias_expires_before_next_lease() -> () {
+    let pool = testing::expect_ok(
+        SqlitePool::new(SqliteDriver::new(), ":memory:", PoolPolicy::standard()),
+        "pool",
+    );
+    let retained: Ref[Option[SqliteConnection]] = Ref::new(Option::None);
+    testing::assert_ok(
+        pool.with_connection(
+            |connection| {
+                connection.execute(pool_query("CREATE TABLE retained_alias(v INTEGER)"))?;
+                retained.set(Option::Some(connection));
+                Result::Ok(())
+            },
+        ),
+    );
+    let stale = testing::expect_some(retained.get(), "retained connection");
+    testing::assert_eq(pool.stats().idle, 1);
+    testing::assert_ok(
+        pool.with_connection(
+            |current| {
+                testing::assert_eq(
+                    testing::expect_err(
+                        stale.execute(pool_query("INSERT INTO retained_alias VALUES(1)")),
+                        "stale execute",
+                    ).kind,
+                    ErrorKind::Closed,
+                );
+                testing::assert_eq(
+                    testing::expect_err(stale.query(pool_query("SELECT 1")), "stale query").kind,
+                    ErrorKind::Closed,
+                );
+                testing::assert_eq(
+                    testing::expect_err(stale.begin(TransactionMode::Immediate), "stale begin").kind,
+                    ErrorKind::Closed,
+                );
+                testing::assert_eq(
+                    testing::expect_err(stale.close(), "stale close").kind,
+                    ErrorKind::Closed,
+                );
+                let row: Row = current.query_one(pool_query("SELECT count(*) FROM retained_alias"))?;
+                let count: i64 = row.get(0)?;
+                testing::assert_eq(count, 0);
+                Result::Ok(())
+            },
+        ),
+    );
+    testing::assert_eq(pool.stats().idle, 1);
+    testing::assert_ok(pool.close());
+}

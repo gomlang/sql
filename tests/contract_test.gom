@@ -1,0 +1,94 @@
+package tests;
+
+use ecosystem::sql::{Value, Params, Query, Row, Column, Error, ErrorKind, PoolPolicy, FromValue};
+use std::bytes::{Bytes};
+use std::testing;
+
+#[test]
+fn query_and_pool_policy_reject_invalid_limits() -> () {
+    testing::assert_err(Query::new("", Params::empty()));
+    testing::assert_err(Query::new("x".repeat(1048577), Params::empty()));
+    testing::assert_ok(Query::new("SELECT 1", Params::empty()));
+    let mut policy = PoolPolicy::standard();
+    testing::assert_ok(policy.validate());
+    policy.max_open = 0;
+    testing::assert_err(policy.validate());
+    policy.max_open = 2;
+    policy.max_idle = 3;
+    testing::assert_err(policy.validate());
+    policy.max_idle = 1;
+    policy.max_result_rows = 1048577;
+    testing::assert_err(policy.validate());
+}
+
+#[test]
+fn typed_rows_reject_ambiguous_names_and_bad_conversions() -> () {
+    testing::assert_err(Row::new(Vec::new(), Vec::from_array([Value::Null])));
+    let row = testing::expect_ok(
+        Row::new(
+            Vec::from_array(
+                [
+                    Column { name: "id", declared_type: "INTEGER" },
+                    Column { name: "name", declared_type: "TEXT" },
+                    Column { name: "active", declared_type: "INTEGER" },
+                ],
+            ),
+            Vec::from_array([Value::Integer(7), Value::Text("Ada"), Value::Integer(1)]),
+        ),
+        "row",
+    );
+    let id: i64 = testing::expect_ok(row.get_named("id"), "id");
+    let name: string = testing::expect_ok(row.get_named("name"), "name");
+    let active: bool = testing::expect_ok(row.get_named("active"), "active");
+    testing::assert_eq(id, 7);
+    testing::assert_eq(name, "Ada");
+    testing::assert(active);
+    let wrong: Result[string, Error] = row.get_named("id");
+    testing::assert_eq(testing::expect_err(wrong, "wrong type").kind, ErrorKind::Conversion);
+    let missing: Result[i64, Error] = row.get_named("unknown");
+    testing::assert_err(missing);
+    let duplicate = testing::expect_ok(
+        Row::new(
+            Vec::from_array(
+                [Column { name: "x", declared_type: "" }, Column { name: "x", declared_type: "" }],
+            ),
+            Vec::from_array([Value::Integer(1), Value::Integer(2)]),
+        ),
+        "duplicate",
+    );
+    testing::assert_err(duplicate.index("x"));
+    let nullable: Option[string] = testing::expect_ok(FromValue::from_value(Value::Null), "null");
+    testing::assert(nullable == Option::None);
+    let blob = Bytes::from_vec(Vec::from_array([0.to_u8(), 255.to_u8()]));
+    let bytes: Bytes = testing::expect_ok(FromValue::from_value(Value::Blob(blob)), "blob");
+    testing::assert(bytes.to_vec() == Vec::from_array([0.to_u8(), 255.to_u8()]));
+}
+
+#[test]
+fn row_and_query_snapshots_include_blob_storage() -> () {
+    let original = Bytes::from_vec(Vec::from_array([7.to_u8()]));
+    let row = testing::expect_ok(
+        Row::new(
+            Vec::from_array([Column { name: "blob", declared_type: "BLOB" }]),
+            Vec::from_array([Value::Blob(original)]),
+        ),
+        "row",
+    );
+    let query = testing::expect_ok(
+        Query::new("SELECT ?", Params::positional(Vec::from_array([Value::Blob(original)]))),
+        "query",
+    );
+    original.set(0, 9);
+    let from_row: Bytes = testing::expect_ok(row.get(0), "row blob");
+    testing::assert_eq(from_row.get(0), 7.to_u8());
+    from_row.set(0, 11);
+    let again: Bytes = testing::expect_ok(row.get(0), "row blob again");
+    testing::assert_eq(again.get(0), 7.to_u8());
+    match query.params() {
+        Params::Positional(values) => match values[0] {
+            Value::Blob(data) => testing::assert_eq(data.get(0), 7.to_u8()),
+            _ => testing::fail("expected blob parameter"),
+        },
+        _ => testing::fail("expected positional parameters"),
+    }
+}
