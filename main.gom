@@ -1,0 +1,46 @@
+package main;
+
+use ecosystem::sql::{Query, Params, Value, Row, Executor, Connection, Transaction, TransactionMode, Error, PoolPolicy};
+use ecosystem::sql::sqlite::{SqliteDriver, SqlitePool};
+use std::testing;
+
+fn query(statement: string, params: Params) -> Query {
+    testing::expect_ok(Query::new(statement, params), "query")
+}
+
+pub fn exercise() -> Result[(), Error] {
+    let database = SqliteDriver::new().memory()?;
+    defer {
+        let _ = database.close();
+    };
+    database.execute(query("CREATE TABLE jobs(id INTEGER, title TEXT)", Params::empty()))?;
+    let transaction = database.begin(TransactionMode::Immediate)?;
+    transaction.execute(
+        query(
+            "INSERT INTO jobs VALUES(?,?)",
+            Params::positional(Vec::from_array([Value::Integer(9), Value::Text("compile")])),
+        ),
+    )?;
+    transaction.commit()?;
+    let row: Row = database.query_one(query("SELECT id,title FROM jobs", Params::empty()))?;
+    let id: i64 = row.get_named("id")?;
+    let title: string = row.get_named("title")?;
+    testing::assert_eq(id, 9);
+    testing::assert_eq(title, "compile");
+    database.close()?;
+    let pool = SqlitePool::new(SqliteDriver::new(), ":memory:", PoolPolicy::standard())?;
+    pool.execute(query("CREATE TABLE pooled(v INTEGER)", Params::empty()))?;
+    let pooled: Row = pool.query_one(
+        query("SELECT count(*) FROM sqlite_master WHERE name='pooled'", Params::empty()),
+    )?;
+    let exists: i64 = pooled.get(0)?;
+    testing::assert_eq(exists, 1);
+    testing::assert_eq(pool.stats().idle, 1);
+    pool.close()?;
+    Result::Ok(())
+}
+
+fn main() -> () {
+    testing::expect_ok(exercise(), "SQL consumer");
+    println("sql consumer: typed row and transaction passed");
+}
