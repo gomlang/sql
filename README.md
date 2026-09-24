@@ -63,5 +63,5 @@ serialization or a future synchronized pool implementation.
 The module and independent consumer require the native SQLite adapter mapping
 and pinned Go dependencies described in the [SQLite README](../sqlite/README.md).
 The repository's `go.mod` files use the local `../sqlite`/`../../sqlite`
-replacement for verification. `just ecosystem-test sql` formats, builds, tests
+replacement for verification. `(cd ../verification && just ecosystem-test sql)` formats, builds, tests
 and runs the module and consumer with the published dependency interface.
