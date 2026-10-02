@@ -1,0 +1,55 @@
+package tests;
+
+use ecosystem::sql::{Query, Params, Row, Execution, Error, ErrorKind, RowCursor, Executor};
+use std::testing;
+
+struct FailingCursor {
+    closes: Ref[isize],
+}
+
+impl RowCursor for FailingCursor {
+    fn next(self: FailingCursor) -> Result[Option[Row], Error] {
+        Result::Err(
+            Error {
+                kind: ErrorKind::Cancelled,
+                message: "consumer read cancelled",
+                source: Option::Some("consumer source"),
+            },
+        )
+    }
+
+    fn close(self: FailingCursor) -> Result[(), Error] {
+        self.closes.set(self.closes.get() + 1);
+        Result::Err(Error::new(ErrorKind::Backend, "consumer close failed"))
+    }
+}
+
+struct FailingExecutor {
+    closes: Ref[isize],
+}
+
+impl Executor for FailingExecutor {
+    type Cursor = FailingCursor;
+
+    fn execute(self: FailingExecutor, _query: Query) -> Result[Execution, Error] {
+        Result::Ok(Execution { rows_affected: 0, last_insert_id: 0 })
+    }
+
+    fn query(self: FailingExecutor, _query: Query) -> Result[FailingCursor, Error] {
+        Result::Ok(FailingCursor { closes: self.closes })
+    }
+}
+
+#[test]
+fn consumer_cursor_failures_preserve_cleanup_evidence() -> () {
+    let closes = Ref::new(0);
+    let executor = FailingExecutor { closes };
+    let query = testing::expect_ok(Query::new("SELECT 1", Params::empty()), "query");
+    let result: Result[Option[Row], Error] = executor.query_optional(query);
+    let error = testing::expect_err(result, "read and cleanup failure");
+    testing::assert_eq(error.kind, ErrorKind::Cancelled);
+    testing::assert(error.source == Option::Some("consumer source"));
+    testing::assert(error.message.contains("consumer read cancelled"));
+    testing::assert(error.message.contains("consumer close failed"));
+    testing::assert_eq(closes.get(), 1);
+}

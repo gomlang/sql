@@ -1,17 +1,28 @@
 package tests;
 
-use ecosystem::sql::{Query, Params, Row, Column, Value, Execution, Error, ErrorKind, RowCursor, Executor};
+use ecosystem::sql::{Query, Params, Row, Column, Value, Execution, Error, ErrorKind, RowCursor, Executor, FromRow};
 use std::testing;
+use std::panic;
 
 struct MockCursor {
     rows: Vec[Row],
     position: Ref[isize],
     closes: Ref[isize],
     fail_close: bool,
+    fail_next: bool,
 }
 
 impl RowCursor for MockCursor {
     fn next(self: MockCursor) -> Result[Option[Row], Error] {
+        if self.fail_next {
+            return Result::Err(
+                Error {
+                    kind: ErrorKind::Backend,
+                    message: "read failed",
+                    source: Option::Some("native read cause"),
+                },
+            )
+        }
         let position = self.position.get();
         if position >= self.rows.len() {
             Result::Ok(Option::None)
@@ -35,6 +46,7 @@ struct MockExecutor {
     rows: Vec[Row],
     closes: Ref[isize],
     fail_close: bool,
+    fail_next: bool,
 }
 
 impl Executor for MockExecutor {
@@ -51,6 +63,7 @@ impl Executor for MockExecutor {
                 position: Ref::new(0),
                 closes: self.closes,
                 fail_close: self.fail_close,
+                fail_next: self.fail_next,
             },
         )
     }
@@ -77,12 +90,13 @@ fn default_query_helpers_close_once_and_surface_close_errors() -> () {
         rows: Vec::from_array([cursor_row(7)]),
         closes,
         fail_close: false,
+        fail_next: false,
     };
     let rows: Vec[Row] = testing::expect_ok(executor.query_all(cursor_query(), 1), "rows");
     testing::assert_eq(rows.len(), 1);
     testing::assert_eq(closes.get(), 1);
     let closes = Ref::new(0);
-    let executor = MockExecutor { rows: Vec::new(), closes, fail_close: false };
+    let executor = MockExecutor { rows: Vec::new(), closes, fail_close: false, fail_next: false };
     let empty: Option[Row] = testing::expect_ok(executor.query_optional(cursor_query()), "empty");
     testing::assert(empty.is_none());
     testing::assert_eq(closes.get(), 1);
@@ -91,13 +105,97 @@ fn default_query_helpers_close_once_and_surface_close_errors() -> () {
         rows: Vec::from_array([cursor_row(1), cursor_row(2)]),
         closes,
         fail_close: false,
+        fail_next: false,
     };
     let multiple: Result[Option[Row], Error] = executor.query_optional(cursor_query());
     testing::assert_eq(testing::expect_err(multiple, "multiple").kind, ErrorKind::MultipleRows);
     testing::assert_eq(closes.get(), 1);
     let closes = Ref::new(0);
-    let executor = MockExecutor { rows: Vec::new(), closes, fail_close: true };
+    let executor = MockExecutor { rows: Vec::new(), closes, fail_close: true, fail_next: false };
     let failed: Result[Option[Row], Error] = executor.query_optional(cursor_query());
     testing::assert_eq(testing::expect_err(failed, "close failure").kind, ErrorKind::Backend);
+    testing::assert_eq(closes.get(), 1);
+}
+
+struct RejectRow {}
+
+impl FromRow for RejectRow {
+    fn from_row(_row: Row) -> Result[RejectRow, Error] {
+        Result::Err(
+            Error {
+                kind: ErrorKind::Conversion,
+                message: "row conversion failed",
+                source: Option::Some("application decoder"),
+            },
+        )
+    }
+}
+
+struct PanicRow {}
+
+impl FromRow for PanicRow {
+    fn from_row(_row: Row) -> Result[PanicRow, Error] {
+        panic::raise("row decoder panicked")
+    }
+}
+
+#[test]
+fn cursor_cleanup_preserves_primary_failure_and_source() -> () {
+    let closes = Ref::new(0);
+    let executor = MockExecutor {
+        rows: Vec::from_array([cursor_row(7)]),
+        closes,
+        fail_close: true,
+        fail_next: false,
+    };
+    let converted: Result[Vec[RejectRow], Error] = executor.query_all(cursor_query(), 1);
+    let error = testing::expect_err(converted, "conversion and close");
+    testing::assert_eq(error.kind, ErrorKind::Conversion);
+    testing::assert(error.source == Option::Some("application decoder"));
+    testing::assert(error.message.contains("row conversion failed"));
+    testing::assert(error.message.contains("cursor cleanup: cursor close failed"));
+    testing::assert_eq(closes.get(), 1);
+    let optional: Result[Option[RejectRow], Error] = executor.query_optional(cursor_query());
+    let error = testing::expect_err(optional, "optional conversion and close");
+    testing::assert_eq(error.kind, ErrorKind::Conversion);
+    testing::assert(error.source == Option::Some("application decoder"));
+    testing::assert(error.message.contains("cursor cleanup: cursor close failed"));
+    let limited: Result[Vec[Row], Error] = executor.query_all(cursor_query(), 0);
+    let error = testing::expect_err(limited, "limit and close");
+    testing::assert_eq(error.kind, ErrorKind::Limit);
+    testing::assert(error.message.contains("cursor cleanup: cursor close failed"));
+    let multiple = MockExecutor {
+        rows: Vec::from_array([cursor_row(1), cursor_row(2)]),
+        ..executor,
+    };
+    let result: Result[Option[Row], Error] = multiple.query_optional(cursor_query());
+    let error = testing::expect_err(result, "multiple and close");
+    testing::assert_eq(error.kind, ErrorKind::MultipleRows);
+    testing::assert(error.message.contains("cursor cleanup: cursor close failed"));
+    let failing = MockExecutor { fail_next: true, ..executor };
+    let result: Result[Vec[Row], Error] = failing.query_all(cursor_query(), 1);
+    let error = testing::expect_err(result, "read and close");
+    testing::assert_eq(error.kind, ErrorKind::Backend);
+    testing::assert(error.source == Option::Some("native read cause"));
+    testing::assert(error.message.contains("read failed; cursor cleanup: cursor close failed"));
+    testing::assert_eq(closes.get(), 5);
+}
+
+#[test]
+fn cursor_cleanup_runs_once_when_row_mapping_panics() -> () {
+    let closes = Ref::new(0);
+    let executor = MockExecutor {
+        rows: Vec::from_array([cursor_row(7)]),
+        closes,
+        fail_close: false,
+        fail_next: false,
+    };
+    let caught = panic::catch(
+        || {
+            let result: Result[Vec[PanicRow], Error] = executor.query_all(cursor_query(), 1);
+            result
+        },
+    );
+    testing::assert(caught.is_err());
     testing::assert_eq(closes.get(), 1);
 }
