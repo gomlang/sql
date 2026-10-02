@@ -1,6 +1,6 @@
 package tests;
 
-use ecosystem::consumers::sql;
+use downstream::sql as sql;
 use std::testing;
 
 #[test]

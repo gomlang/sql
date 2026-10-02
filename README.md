@@ -60,8 +60,19 @@ synchronization across parallel tasks. It refuses an exhausted pool
 immediately. Applications needing concurrent sharing must provide their own
 serialization or a future synchronized pool implementation.
 
-The module and independent consumer require the native SQLite adapter mapping
+The module and native downstream fixture use the native SQLite adapter mapping
 and pinned Go dependencies described in the [SQLite README](../sqlite/README.md).
-The repository's `go.mod` files use the local `../sqlite`/`../../sqlite`
-replacement for verification. `(cd ../verification && just ecosystem-test sql)` formats, builds, tests
-and runs the module and consumer with the published dependency interface.
+The root `go.mod` uses the local `../sqlite` replacement; the fixture
+uses `../../../../sqlite` from `testdata/downstream/native`. `(cd ../verification && just ecosystem-test sql)` formats, builds, tests
+and runs the module and fixture through the isolated registry snapshot.
+
+## Development and downstream checks
+
+Requires GoML 0.1.55 or newer. The independent native fixture is in `testdata/downstream/native/`; it retains a separate manifest and Go module for native dependencies. From the library root, run:
+
+```sh
+goml test
+goml verify --timeout 300s
+```
+
+`goml verify` builds and tests the fixture against an isolated registry snapshot. `(cd ../verification && just ecosystem-test sql)` also runs the library-specific smoke and compatibility checks.
