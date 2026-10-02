@@ -1,0 +1,360 @@
+package tests;
+
+use ecosystem::sql::{PoolPolicy, Row, Error, ErrorKind, Executor, Connection, Transaction, RowCursor, TransactionMode};
+use ecosystem::sql::sqlite::{SqliteDriver, SqlitePool, SqliteConnection, SqliteRows, SqliteTransaction};
+use std::context;
+use std::task;
+use std::time;
+use std::panic;
+use std::testing;
+
+fn concurrent_pool(capacity: isize, idle: isize) -> SqlitePool {
+    testing::expect_ok(
+        SqlitePool::new(
+            SqliteDriver::new(),
+            ":memory:",
+            PoolPolicy { max_open: capacity, max_idle: idle, max_result_rows: 10 },
+        ),
+        "concurrent pool",
+    )
+}
+
+#[test]
+fn concurrent_pool_bounds_active_leases_and_wakes_waiters_on_return() -> () {
+    let pool = concurrent_pool(2, 1);
+    let entered: Channel[()] = Channel::new(2);
+    let release: Channel[()] = Channel::new(0);
+    task::scope(
+        |scope| {
+            defer release.close();
+            let held = Vec::new();
+            for _ in 0..2 {
+                held.push(
+                    scope.spawn(
+                        |_| pool.with_connection(
+                            |_| {
+                                entered.send(());
+                                let _ = release.recv();
+                                Result::Ok(())
+                            },
+                        ),
+                    ),
+                );
+            }
+            let _ = entered.recv();
+            let _ = entered.recv();
+            testing::assert_eq(pool.stats().open, 2);
+            testing::assert_eq(pool.stats().in_use, 2);
+            let waiting = Vec::new();
+            for _ in 0..12 {
+                waiting.push(
+                    scope.spawn(
+                        |_| context::with_timeout(
+                            context::Context::background(),
+                            time::Duration::from_seconds(5),
+                            |ctx, _| {
+                                pool.with_connection_with_context(
+                                    ctx,
+                                    |connection| {
+                                        testing::assert(pool.stats().open <= 2);
+                                        let row: Row = connection.query_one(pool_query("SELECT 7"))?;
+                                        let value: i64 = row.get(0)?;
+                                        testing::assert_eq(value, 7);
+                                        Result::Ok(())
+                                    },
+                                )
+                            },
+                        ),
+                    ),
+                );
+            }
+            release.send(());
+            release.send(());
+            for worker in held {
+                testing::assert_ok(worker.join());
+            }
+            for worker in waiting {
+                testing::assert_ok(worker.join());
+            }
+        },
+    );
+    testing::assert_eq(pool.stats().open, 1);
+    testing::assert_eq(pool.stats().idle, 1);
+    testing::assert_eq(pool.stats().in_use, 0);
+    testing::assert_ok(pool.close());
+    testing::assert_eq(pool.stats().open, 0);
+}
+
+#[test]
+fn pool_waiting_acquisition_honors_deadlines_and_cancellation() -> () {
+    let pool = concurrent_pool(1, 1);
+    testing::assert_ok(
+        pool.with_connection(
+            |_| {
+                context::with_timeout(
+                    context::Context::background(),
+                    time::Duration::from_milliseconds(20),
+                    |ctx, _| {
+                        let result: Result[(), Error] = pool.with_connection_with_context(
+                            ctx,
+                            |_| Result::Ok(()),
+                        );
+                        testing::assert_eq(
+                            testing::expect_err(result, "wait deadline").kind,
+                            ErrorKind::Timeout,
+                        );
+                    },
+                );
+                context::with_cancel(
+                    context::Context::background(),
+                    |ctx, cancel| task::scope(
+                        |scope| {
+                            let started: Channel[()] = Channel::new(0);
+                            let waiting = scope.spawn(
+                                |_| {
+                                    started.close();
+                                    pool.with_connection_with_context(ctx, |_| Result::Ok(()))
+                                },
+                            );
+                            let _ = started.recv();
+                            cancel.cancel();
+                            testing::assert_eq(
+                                testing::expect_err(waiting.join(), "cancel wait").kind,
+                                ErrorKind::Cancelled,
+                            );
+                        },
+                    ),
+                );
+                testing::assert_eq(pool.stats().in_use, 1);
+                Result::Ok(())
+            },
+        ),
+    );
+    context::with_cancel(
+        context::Context::background(),
+        |ctx, cancel| {
+            cancel.cancel();
+            let result: Result[(), Error] = pool.with_connection_with_context(
+                ctx,
+                |_| Result::Ok(()),
+            );
+            testing::assert_eq(
+                testing::expect_err(result, "cancelled idle checkout").kind,
+                ErrorKind::Cancelled,
+            );
+        },
+    );
+    testing::assert_eq(pool.stats().idle, 1);
+    testing::assert_ok(pool.close());
+}
+
+#[test]
+fn pool_close_wakes_all_waiters_and_preserves_active_lease_until_return() -> () {
+    let pool = concurrent_pool(1, 1);
+    testing::assert_ok(
+        pool.with_connection(
+            |connection| {
+                task::scope(
+                    |scope| {
+                        let waiting = Vec::new();
+                        for _ in 0..8 {
+                            waiting.push(
+                                scope.spawn(
+                                    |_| pool.with_connection_with_context(
+                                        context::Context::background(),
+                                        |_| Result::Ok(()),
+                                    ),
+                                ),
+                            );
+                        }
+                        let closing = scope.spawn(|_| pool.close());
+                        testing::assert_ok(pool.close());
+                        testing::assert_ok(closing.join());
+                        for worker in waiting {
+                            testing::assert_eq(
+                                testing::expect_err(worker.join(), "closed wait").kind,
+                                ErrorKind::Closed,
+                            );
+                        }
+                    },
+                );
+                testing::assert_eq(pool.stats().in_use, 1);
+                testing::assert_ok(
+                    connection.execute(pool_query("CREATE TABLE still_active(v INTEGER)")),
+                );
+                Result::Ok(())
+            },
+        ),
+    );
+    testing::assert_eq(pool.stats().open, 0);
+    testing::assert(pool.stats().closed);
+    testing::assert_ok(pool.close());
+}
+
+#[test]
+fn concurrent_alias_calls_cannot_cross_lease_expiration() -> () {
+    let pool = concurrent_pool(1, 1);
+    task::scope(
+        |scope| {
+            let handle: Channel[SqliteConnection] = Channel::new(1);
+            let started: Channel[()] = Channel::new(0);
+            let finished: Channel[()] = Channel::new(0);
+            let worker = scope.spawn(
+                |_| {
+                    let connection = testing::expect_some(handle.recv(), "shared lease");
+                    let first: Row = testing::expect_ok(
+                        connection.query_one(pool_query("SELECT 1")),
+                        "first shared call",
+                    );
+                    let value: i64 = testing::expect_ok(first.get(0), "value");
+                    testing::assert_eq(value, 1);
+                    started.close();
+                    for _ in 0..200 {
+                        let result = connection.execute(
+                            pool_query("CREATE TABLE IF NOT EXISTS before_expiration(v INTEGER)"),
+                        );
+                        if let Err(error) = result {
+                            testing::assert_eq(error.kind, ErrorKind::Closed);
+                        }
+                    }
+                    let _ = finished.recv();
+                    testing::assert_eq(
+                        testing::expect_err(connection.close(), "expired close").kind,
+                        ErrorKind::Closed,
+                    );
+                },
+            );
+            testing::assert_ok(
+                pool.with_connection(
+                    |connection| {
+                        handle.send(connection);
+                        let _ = started.recv();
+                        Result::Ok(())
+                    },
+                ),
+            );
+            testing::assert_ok(
+                pool.with_connection(
+                    |current| {
+                        let row: Row = current.query_one(pool_query("SELECT 9"))?;
+                        let value: i64 = row.get(0)?;
+                        testing::assert_eq(value, 9);
+                        finished.close();
+                        worker.join();
+                        Result::Ok(())
+                    },
+                ),
+            );
+        },
+    );
+    testing::assert_ok(pool.close());
+}
+
+#[test]
+fn escaped_cursor_and_transaction_expire_with_the_lease() -> () {
+    let pool = concurrent_pool(1, 1);
+    let cursor: Ref[Option[SqliteRows]] = Ref::new(Option::None);
+    let tx: Ref[Option[SqliteTransaction]] = Ref::new(Option::None);
+    let result: Result[(), Error] = pool.with_connection(
+        |connection| {
+            let transaction = connection.begin(TransactionMode::Deferred)?;
+            cursor.set(Option::Some(transaction.query(pool_query("SELECT 1"))?));
+            tx.set(Option::Some(transaction));
+            Result::Ok(())
+        },
+    );
+    testing::assert_eq(testing::expect_err(result, "live resources").kind, ErrorKind::Argument);
+    let rows = testing::expect_some(cursor.get(), "escaped cursor");
+    let transaction = testing::expect_some(tx.get(), "escaped transaction");
+    testing::assert_eq(testing::expect_err(rows.next(), "expired next").kind, ErrorKind::Closed);
+    testing::assert_eq(
+        testing::expect_err(rows.close(), "expired cursor close").kind,
+        ErrorKind::Closed,
+    );
+    testing::assert_eq(
+        testing::expect_err(transaction.commit(), "expired commit").kind,
+        ErrorKind::Closed,
+    );
+    testing::assert_eq(
+        testing::expect_err(transaction.rollback(), "expired rollback").kind,
+        ErrorKind::Closed,
+    );
+    testing::assert_eq(pool.stats().open, 0);
+    testing::assert_ok(pool.close());
+}
+
+#[test]
+fn failed_open_releases_capacity_and_context_convenience_methods_work() -> () {
+    let broken = testing::expect_ok(
+        SqlitePool::new(SqliteDriver::new(), "file:invalid?mode=invalid", PoolPolicy::standard()),
+        "invalid backend pool",
+    );
+    for _ in 0..3 {
+        let result: Result[(), Error] = broken.with_connection_with_context(
+            context::Context::background(),
+            |_| Result::Ok(()),
+        );
+        testing::assert(result.is_err());
+        testing::assert_eq(broken.stats().open, 0);
+    }
+    testing::assert_ok(broken.close());
+    let pool = concurrent_pool(1, 1);
+    let ctx = context::Context::background();
+    testing::assert_ok(
+        pool.execute_with_context(ctx, pool_query("CREATE TABLE values_table(v INTEGER)")),
+    );
+    let missing: Option[Row] = testing::expect_ok(
+        pool.query_optional_with_context(ctx, pool_query("SELECT v FROM values_table")),
+        "empty result",
+    );
+    testing::assert(missing.is_none());
+    testing::assert_ok(
+        pool.execute_with_context(ctx, pool_query("INSERT INTO values_table VALUES(3)")),
+    );
+    let rows: Vec[Row] = testing::expect_ok(
+        pool.query_all_with_context(ctx, pool_query("SELECT v FROM values_table")),
+        "all rows",
+    );
+    testing::assert_eq(rows.len(), 1);
+    let row: Row = testing::expect_ok(
+        pool.query_one_with_context(ctx, pool_query("SELECT v FROM values_table")),
+        "one row",
+    );
+    let value: i64 = testing::expect_ok(row.get(0), "value");
+    testing::assert_eq(value, 3);
+    testing::assert_ok(pool.close());
+}
+
+#[test]
+fn context_lease_cleanup_preserves_callback_errors_and_releases_after_panic() -> () {
+    let pool = concurrent_pool(1, 1);
+    let result: Result[(), Error] = pool.with_connection_with_context(
+        context::Context::background(),
+        |connection| {
+            let _ = connection.begin(TransactionMode::Deferred)?;
+            Result::Err(Error::new(ErrorKind::Conversion, "callback failed"))
+        },
+    );
+    let error = testing::expect_err(result, "callback and cleanup errors");
+    testing::assert_eq(error.kind, ErrorKind::Conversion);
+    testing::assert(error.message.starts_with("callback failed; cleanup: "));
+    testing::assert_eq(pool.stats().open, 0);
+    let unwind = panic::catch(
+        || {
+            let result: Result[(), Error] = pool.with_connection_with_context(
+                context::Context::background(),
+                |_| {
+                    panic::raise("callback panic")
+                },
+            );
+            result
+        },
+    );
+    testing::assert(unwind.is_err());
+    testing::assert_eq(pool.stats().in_use, 0);
+    testing::assert_eq(pool.stats().idle, 1);
+    let row: Row = testing::expect_ok(pool.query_one(pool_query("SELECT 11")), "lease after panic");
+    let value: i64 = testing::expect_ok(row.get(0), "value");
+    testing::assert_eq(value, 11);
+    testing::assert_ok(pool.close());
+}

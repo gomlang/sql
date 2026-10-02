@@ -1,9 +1,51 @@
 package tests;
 
 use downstream::sql as sql;
+use ecosystem::sql as database;
+use ecosystem::sql::sqlite::{SqlitePool, SqliteDriver};
+use std::context;
+use std::task;
+use std::time;
 use std::testing;
 
 #[test]
 fn published_sql_contract_over_sqlite_backend() -> () {
     testing::assert_ok(sql::exercise());
+}
+
+#[test]
+fn published_sql_pool_supports_concurrent_context_checkout() -> () {
+    let pool = testing::expect_ok(
+        SqlitePool::new(SqliteDriver::new(), ":memory:", database::PoolPolicy::standard()),
+        "pool",
+    );
+    task::scope(
+        |scope| {
+            let workers = Vec::new();
+            for _ in 0..4 {
+                workers.push(
+                    scope.spawn(
+                        |_| context::with_timeout(
+                            context::Context::background(),
+                            time::Duration::from_seconds(5),
+                            |ctx, _| {
+                                let query = database::Query::new(
+                                    "SELECT 42",
+                                    database::Params::empty(),
+                                )?;
+                                let row: database::Row = pool.query_one_with_context(ctx, query)?;
+                                let value: i64 = row.get(0)?;
+                                testing::assert_eq(value, 42);
+                                Result::Ok(())
+                            },
+                        ),
+                    ),
+                );
+            }
+            for worker in workers {
+                testing::assert_ok(worker.join());
+            }
+        },
+    );
+    testing::assert_ok(pool.close());
 }
