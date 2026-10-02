@@ -33,9 +33,23 @@ also fails after a read, row-limit or conversion error, the original kind and
 source are retained and the cleanup failure is appended to its message. A close
 failure after otherwise successful collection is returned directly. `query_one`
 requires exactly one row;
-`query_optional` allows zero or one. Values and rows have no byte-total cap
-beyond the backend's limits, so stream large results through `query` and close
-the cursor. Transactions expose explicit `commit` and `rollback`; unfinished
+`query_optional` allows zero or one.
+
+`query_all_with_limits[T](query, CollectionLimits { max_rows, max_bytes })`
+adds a cumulative value payload budget. The row cap is 0 through 1,048,576;
+the byte cap is any nonnegative `isize`. Limits are validated before opening
+a cursor. Each row is charged before `FromRow` runs: NULL costs zero, INTEGER
+and REAL cost eight bytes, and TEXT, non-UTF-8 TEXT and BLOB cost their byte
+length. An exact fit succeeds; exceeding either cap returns `Limit` and closes
+the cursor with the same error preservation rules. Empty results and zero-byte
+values can fit a zero byte budget. With a pool, call the method on the executor
+inside `with_connection` or `with_connection_with_context`.
+
+These budgets bound collected input payload, not peak process memory: backend
+row materialization, column metadata, container overhead, snapshot copies and
+allocations in a custom `FromRow` are outside the budget. The existing
+`query_all` remains row-bounded only. Stream large results through `query` and
+close the cursor. Transactions expose explicit `commit` and `rollback`; unfinished
 transactions should be rolled back with `defer`. The SQLite adapter delegates
 transaction isolation, cancellation and connection serialization to
 `ecosystem::sqlite`.

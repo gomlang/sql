@@ -1,0 +1,62 @@
+package sql;
+
+pub struct CollectionLimits {
+    pub max_rows: isize,
+    pub max_bytes: isize,
+}
+
+impl CollectionLimits {
+    fn validate(self: CollectionLimits) -> Result[(), Error] {
+        if self.max_rows < 0 || self.max_rows > 1048576 || self.max_bytes < 0 {
+            return Result::Err(Error::new(ErrorKind::Limit, "invalid result collection limits"))
+        }
+        Result::Ok(())
+    }
+}
+
+impl Row {
+    fn charge(self: Row, remaining: isize) -> Result[isize, Error] {
+        let mut remaining = remaining;
+        for value in self.values {
+            let size = match value {
+                Value::Null => 0,
+                Value::Integer(_) | Value::Real(_) => 8,
+                Value::Text(value) => value.byte_len(),
+                Value::TextBytes(value) | Value::Blob(value) => value.len(),
+            };
+            if size > remaining {
+                return Result::Err(Error::new(ErrorKind::Limit, "query result exceeds byte limit"))
+            }
+            remaining -= size;
+        }
+        Result::Ok(remaining)
+    }
+}
+
+fn collect_cursor[C: RowCursor, T: FromRow](cursor: C, max_rows: isize, max_bytes: Option[isize]) -> Result[
+    Vec[T],
+    Error,
+] {
+    with_cursor(
+        cursor,
+        |rows| {
+            let result: Vec[T] = Vec::new();
+            let mut remaining = max_bytes;
+            loop {
+                let Some(row) = rows.next()? else {
+                    break
+                };
+                if result.len() >= max_rows {
+                    return Result::Err(
+                        Error::new(ErrorKind::Limit, "query result exceeds row limit"),
+                    )
+                }
+                if let Some(bytes) = remaining {
+                    remaining = Option::Some(row.charge(bytes)?);
+                }
+                result.push(FromRow::from_row(row)?);
+            }
+            Result::Ok(result)
+        },
+    )
+}

@@ -379,24 +379,14 @@ pub trait Executor {
         if max_rows < 0 || max_rows > 1048576 {
             return Result::Err(Error::new(ErrorKind::Limit, "invalid result row limit"))
         }
-        with_cursor(
-            self.query(query)?,
-            |rows| {
-                let result: Vec[T] = Vec::new();
-                loop {
-                    let Some(row) = rows.next()? else {
-                        break
-                    };
-                    if result.len() >= max_rows {
-                        return Result::Err(
-                            Error::new(ErrorKind::Limit, "query result exceeds row limit"),
-                        )
-                    }
-                    result.push(FromRow::from_row(row)?);
-                }
-                Result::Ok(result)
-            },
-        )
+        collect_cursor(self.query(query)?, max_rows, Option::None)
+    }
+    fn query_all_with_limits[T: FromRow](self: Self, query: Query, limits: CollectionLimits) -> Result[
+        Vec[T],
+        Error,
+    ] {
+        limits.validate()?;
+        collect_cursor(self.query(query)?, limits.max_rows, Option::Some(limits.max_bytes))
     }
     fn query_optional[T: FromRow](self: Self, query: Query) -> Result[Option[T], Error] {
         with_cursor(
