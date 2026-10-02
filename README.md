@@ -28,7 +28,11 @@ application record. Duplicate column names make `get_named` ambiguous rather
 than silently choosing one.
 
 `query_all` requires an explicit row cap of 0 through 1,048,576 and closes its
-cursor on both success and failure. `query_one` requires exactly one row;
+cursor exactly once on success, failure and panic unwinding. If cursor closure
+also fails after a read, row-limit or conversion error, the original kind and
+source are retained and the cleanup failure is appended to its message. A close
+failure after otherwise successful collection is returned directly. `query_one`
+requires exactly one row;
 `query_optional` allows zero or one. Values and rows have no byte-total cap
 beyond the backend's limits, so stream large results through `query` and close
 the cursor. Transactions expose explicit `commit` and `rollback`; unfinished

@@ -344,6 +344,33 @@ pub trait RowCursor {
     fn close(self: Self) -> Result[(), Error];
 }
 
+fn with_cursor[C: RowCursor, T](cursor: C, callback: (C) -> Result[T, Error]) -> Result[T, Error] {
+    let closed = Ref::new(false);
+    defer {
+        if !closed.get() {
+            let _ = cursor.close();
+        }
+    };
+    let result = callback(cursor);
+    closed.set(true);
+    let cleanup = cursor.close();
+    match result {
+        Ok(value) => {
+            cleanup?;
+            Result::Ok(value)
+        },
+        Err(error) => match cleanup {
+            Ok(_) => Result::Err(error),
+            Err(cleanup) => Result::Err(
+                Error {
+                    message: error.message + "; cursor cleanup: " + cleanup.to_string(),
+                    ..error,
+                },
+            ),
+        },
+    }
+}
+
 pub trait Executor {
     type Cursor: RowCursor;
     fn execute(self: Self, query: Query) -> Result[Execution, Error];
@@ -352,48 +379,40 @@ pub trait Executor {
         if max_rows < 0 || max_rows > 1048576 {
             return Result::Err(Error::new(ErrorKind::Limit, "invalid result row limit"))
         }
-        let rows = self.query(query)?;
-        let closed = Ref::new(false);
-        defer {
-            if !closed.get() {
-                let _ = rows.close();
-            }
-        };
-        let result: Vec[T] = Vec::new();
-        loop {
-            let Some(row) = rows.next()? else {
-                break
-            };
-            if result.len() >= max_rows {
-                return Result::Err(Error::new(ErrorKind::Limit, "query result exceeds row limit"))
-            }
-            result.push(FromRow::from_row(row)?);
-        }
-        closed.set(true);
-        rows.close()?;
-        Result::Ok(result)
+        with_cursor(
+            self.query(query)?,
+            |rows| {
+                let result: Vec[T] = Vec::new();
+                loop {
+                    let Some(row) = rows.next()? else {
+                        break
+                    };
+                    if result.len() >= max_rows {
+                        return Result::Err(
+                            Error::new(ErrorKind::Limit, "query result exceeds row limit"),
+                        )
+                    }
+                    result.push(FromRow::from_row(row)?);
+                }
+                Result::Ok(result)
+            },
+        )
     }
     fn query_optional[T: FromRow](self: Self, query: Query) -> Result[Option[T], Error] {
-        let rows = self.query(query)?;
-        let closed = Ref::new(false);
-        defer {
-            if !closed.get() {
-                let _ = rows.close();
-            }
-        };
-        let Some(first) = rows.next()? else {
-            closed.set(true);
-            rows.close()?;
-            return Result::Ok(Option::None)
-        };
-        if rows.next()?.is_some() {
-            return Result::Err(
-                Error::new(ErrorKind::MultipleRows, "expected at most one result row"),
-            )
-        }
-        closed.set(true);
-        rows.close()?;
-        Result::Ok(Option::Some(FromRow::from_row(first)?))
+        with_cursor(
+            self.query(query)?,
+            |rows| {
+                let Some(first) = rows.next()? else {
+                    return Result::Ok(Option::None)
+                };
+                if rows.next()?.is_some() {
+                    return Result::Err(
+                        Error::new(ErrorKind::MultipleRows, "expected at most one result row"),
+                    )
+                }
+                Result::Ok(Option::Some(FromRow::from_row(first)?))
+            },
+        )
     }
     fn query_one[T: FromRow](self: Self, query: Query) -> Result[T, Error] {
         self.query_optional(query)?.ok_or(Error::new(ErrorKind::NoRows, "query returned no rows"))
