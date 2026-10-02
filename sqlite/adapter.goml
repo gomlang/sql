@@ -8,39 +8,61 @@ pub struct SqliteDriver {}
 
 pub struct SqliteConnection {
     database: native::Database,
-    lease_active: Option[Ref[bool]],
+    lease: Option[LeaseState],
 }
 
 pub struct SqliteTransaction {
     transaction: native::Transaction,
+    lease: Option[LeaseState],
 }
 
 pub struct SqliteRows {
     rows: native::Rows,
+    lease: Option[LeaseState],
+}
+
+struct LeaseState {
+    gate: Channel[()],
+    active: Ref[bool],
+}
+
+fn enter_lease(lease: Option[LeaseState]) -> Result[(), Error] {
+    if let Some(lease) = lease {
+        let _ = lease.gate.recv();
+        if !lease.active.get() {
+            lease.gate.send(());
+            return Result::Err(Error::new(ErrorKind::Closed, "SQL connection lease has ended"))
+        }
+    }
+    Result::Ok(())
+}
+
+fn leave_lease(lease: Option[LeaseState]) -> () {
+    if let Some(lease) = lease {
+        lease.gate.send(());
+    }
 }
 
 impl SqliteConnection {
     fn leased(self: SqliteConnection) -> SqliteConnection {
-        SqliteConnection { database: self.database, lease_active: Option::Some(Ref::new(true)) }
+        let gate = Channel::new(1);
+        gate.send(());
+        SqliteConnection {
+            database: self.database,
+            lease: Option::Some(LeaseState { gate, active: Ref::new(true) }),
+        }
     }
 
     fn unleased(self: SqliteConnection) -> SqliteConnection {
-        SqliteConnection { database: self.database, lease_active: Option::None }
+        SqliteConnection { database: self.database, lease: Option::None }
     }
 
     fn expire_lease(self: SqliteConnection) -> () {
-        if let Some(active) = self.lease_active {
-            active.set(false);
+        if let Some(lease) = self.lease {
+            let _ = lease.gate.recv();
+            lease.active.set(false);
+            lease.gate.send(());
         }
-    }
-
-    fn require_active_lease(self: SqliteConnection) -> Result[(), Error] {
-        if let Some(active) = self.lease_active {
-            if !active.get() {
-                return Result::Err(Error::new(ErrorKind::Closed, "SQL connection lease has ended"))
-            }
-        }
-        Result::Ok(())
     }
 }
 
@@ -122,7 +144,7 @@ impl SqliteDriver {
         Result::Ok(
             SqliteConnection {
                 database: native::Database::memory().map_err(convert_error)?,
-                lease_active: Option::None,
+                lease: Option::None,
             },
         )
     }
@@ -135,7 +157,7 @@ impl sql::Driver for SqliteDriver {
         Result::Ok(
             SqliteConnection {
                 database: native::Database::open(dsn).map_err(convert_error)?,
-                lease_active: Option::None,
+                lease: Option::None,
             },
         )
     }
@@ -143,6 +165,8 @@ impl sql::Driver for SqliteDriver {
 
 impl sql::RowCursor for SqliteRows {
     fn next(self: SqliteRows) -> Result[Option[Row], Error] {
+        enter_lease(self.lease)?;
+        defer leave_lease(self.lease);
         match self.rows.next().map_err(convert_error)? {
             Some(row) => Result::Ok(Option::Some(sql_row(row)?)),
             None => Result::Ok(Option::None),
@@ -150,6 +174,8 @@ impl sql::RowCursor for SqliteRows {
     }
 
     fn close(self: SqliteRows) -> Result[(), Error] {
+        enter_lease(self.lease)?;
+        defer leave_lease(self.lease);
         self.rows.close().map_err(convert_error)
     }
 }
@@ -158,7 +184,8 @@ impl sql::Executor for SqliteConnection {
     type Cursor = SqliteRows;
 
     fn execute(self: SqliteConnection, query: Query) -> Result[Execution, Error] {
-        self.require_active_lease()?;
+        enter_lease(self.lease)?;
+        defer leave_lease(self.lease);
         let result = native::Executor::execute(
             self.database,
             query.statement(),
@@ -170,9 +197,11 @@ impl sql::Executor for SqliteConnection {
     }
 
     fn query(self: SqliteConnection, query: Query) -> Result[SqliteRows, Error] {
-        self.require_active_lease()?;
+        enter_lease(self.lease)?;
+        defer leave_lease(self.lease);
         Result::Ok(
             SqliteRows {
+                lease: self.lease,
                 rows: native::Executor::query(
                     self.database,
                     query.statement(),
@@ -187,6 +216,8 @@ impl sql::Executor for SqliteTransaction {
     type Cursor = SqliteRows;
 
     fn execute(self: SqliteTransaction, query: Query) -> Result[Execution, Error] {
+        enter_lease(self.lease)?;
+        defer leave_lease(self.lease);
         let result = native::Executor::execute(
             self.transaction,
             query.statement(),
@@ -198,8 +229,11 @@ impl sql::Executor for SqliteTransaction {
     }
 
     fn query(self: SqliteTransaction, query: Query) -> Result[SqliteRows, Error] {
+        enter_lease(self.lease)?;
+        defer leave_lease(self.lease);
         Result::Ok(
             SqliteRows {
+                lease: self.lease,
                 rows: native::Executor::query(
                     self.transaction,
                     query.statement(),
@@ -214,29 +248,38 @@ impl sql::Connection for SqliteConnection {
     type Tx = SqliteTransaction;
 
     fn begin(self: SqliteConnection, mode: TransactionMode) -> Result[SqliteTransaction, Error] {
-        self.require_active_lease()?;
+        enter_lease(self.lease)?;
+        defer leave_lease(self.lease);
         let mode = match mode {
             TransactionMode::Deferred => native::TransactionMode::Deferred,
             TransactionMode::Immediate => native::TransactionMode::Immediate,
             TransactionMode::Exclusive => native::TransactionMode::Exclusive,
         };
         Result::Ok(
-            SqliteTransaction { transaction: self.database.begin(mode).map_err(convert_error)? },
+            SqliteTransaction {
+                transaction: self.database.begin(mode).map_err(convert_error)?,
+                lease: self.lease,
+            },
         )
     }
 
     fn close(self: SqliteConnection) -> Result[(), Error] {
-        self.require_active_lease()?;
+        enter_lease(self.lease)?;
+        defer leave_lease(self.lease);
         self.database.close().map_err(convert_error)
     }
 }
 
 impl sql::Transaction for SqliteTransaction {
     fn commit(self: SqliteTransaction) -> Result[(), Error] {
+        enter_lease(self.lease)?;
+        defer leave_lease(self.lease);
         self.transaction.commit().map_err(convert_error)
     }
 
     fn rollback(self: SqliteTransaction) -> Result[(), Error] {
+        enter_lease(self.lease)?;
+        defer leave_lease(self.lease);
         self.transaction.rollback().map_err(convert_error)
     }
 }

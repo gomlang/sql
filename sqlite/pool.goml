@@ -1,5 +1,6 @@
 package sqlite;
 
+use std::context;
 use ecosystem::sql::{PoolPolicy, Query, Error, ErrorKind, Execution, FromRow, Driver, Connection, Executor};
 
 pub struct PoolStats {
@@ -15,7 +16,33 @@ pub struct SqlitePool {
     policy: PoolPolicy,
     idle: Vec[SqliteConnection],
     opened: Ref[isize],
-    closed: Ref[bool],
+    gate: Channel[()],
+    changed: Ref[Channel[()]],
+    closed: Channel[()],
+    close_gate: Channel[()],
+}
+
+enum PoolChoice {
+    Ready(SqliteConnection),
+    Open,
+    Wait(Channel[()]),
+}
+
+fn pool_closed() -> Error {
+    Error::new(ErrorKind::Closed, "SQL pool is closed")
+}
+
+fn pool_context_error(error: context::Error) -> Error {
+    match error {
+        context::Error::Cancelled => Error::new(
+            ErrorKind::Cancelled,
+            "SQL pool acquisition cancelled",
+        ),
+        context::Error::DeadlineExceeded => Error::new(
+            ErrorKind::Timeout,
+            "SQL pool acquisition deadline exceeded",
+        ),
+    }
 }
 
 impl SqlitePool {
@@ -24,6 +51,10 @@ impl SqlitePool {
         if dsn == "" {
             return Result::Err(Error::new(ErrorKind::Argument, "empty SQL data source"))
         }
+        let gate = Channel::new(1);
+        gate.send(());
+        let close_gate = Channel::new(1);
+        close_gate.send(());
         Result::Ok(
             SqlitePool {
                 driver,
@@ -31,7 +62,10 @@ impl SqlitePool {
                 policy,
                 idle: Vec::new(),
                 opened: Ref::new(0),
-                closed: Ref::new(false),
+                gate,
+                changed: Ref::new(Channel::new(0)),
+                closed: Channel::new(0),
+                close_gate,
             },
         )
     }
@@ -40,28 +74,114 @@ impl SqlitePool {
         self.policy
     }
 
+    fn is_closed(self: SqlitePool) -> bool {
+        select {
+            recv(self.closed) as _ => true,
+            default => false,
+        }
+    }
+
+    fn notify(self: SqlitePool) -> () {
+        self.changed.get().close();
+        self.changed.set(Channel::new(0));
+    }
+
     pub fn stats(self: SqlitePool) -> PoolStats {
+        let _ = self.gate.recv();
+        defer self.gate.send(());
         PoolStats {
             open: self.opened.get(),
             idle: self.idle.len(),
             in_use: self.opened.get() - self.idle.len(),
-            closed: self.closed.get(),
+            closed: self.is_closed(),
         }
     }
 
-    fn acquire(self: SqlitePool) -> Result[SqliteConnection, Error] {
-        if self.closed.get() {
-            return Result::Err(Error::new(ErrorKind::Closed, "SQL pool is closed"))
+    fn choose(self: SqlitePool, ctx: Option[context::Context]) -> Result[PoolChoice, Error] {
+        match ctx {
+            Some(ctx) => {
+                ctx.check().map_err(pool_context_error)?;
+                select {
+                    recv(self.gate) as _ => (),
+                    recv(self.closed) as _ => return Result::Err(pool_closed()),
+                    recv(ctx.done()) as _ => {
+                        return Result::Err(
+                            pool_context_error(ctx.error().unwrap_or(context::Error::Cancelled)),
+                        )
+                    },
+                }
+            },
+            None => {
+                let _ = self.gate.recv();
+            },
+        }
+        defer self.gate.send(());
+        if self.is_closed() {
+            return Result::Err(pool_closed())
+        }
+        if let Some(ctx) = ctx {
+            ctx.check().map_err(pool_context_error)?;
         }
         if let Some(connection) = self.idle.pop() {
-            return Result::Ok(connection.leased())
+            return Result::Ok(PoolChoice::Ready(connection))
         }
-        if self.opened.get() >= self.policy.max_open {
+        if self.opened.get() < self.policy.max_open {
+            self.opened.set(self.opened.get() + 1);
+            return Result::Ok(PoolChoice::Open)
+        }
+        if ctx.is_none() {
             return Result::Err(Error::new(ErrorKind::Busy, "SQL pool is at max_open"))
         }
-        let connection = self.driver.connect(self.dsn)?;
-        self.opened.set(self.opened.get() + 1);
-        Result::Ok(connection.leased())
+        Result::Ok(PoolChoice::Wait(self.changed.get()))
+    }
+
+    fn free_capacity(self: SqlitePool) -> () {
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        self.opened.set(self.opened.get() - 1);
+        self.notify();
+    }
+
+    fn acquire(self: SqlitePool, ctx: Option[context::Context]) -> Result[SqliteConnection, Error] {
+        loop {
+            let connection = match self.choose(ctx)? {
+                PoolChoice::Ready(connection) => connection,
+                PoolChoice::Open => match self.driver.connect(self.dsn) {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        self.free_capacity();
+                        return Result::Err(error)
+                    },
+                },
+                PoolChoice::Wait(changed) => {
+                    if let Some(ctx) = ctx {
+                        select {
+                            recv(changed) as _ => (),
+                            recv(self.closed) as _ => return Result::Err(pool_closed()),
+                            recv(ctx.done()) as _ => {
+                                return Result::Err(
+                                    pool_context_error(
+                                        ctx.error().unwrap_or(context::Error::Cancelled),
+                                    ),
+                                )
+                            },
+                        }
+                    }
+                    continue
+                },
+            };
+            let connection = connection.leased();
+            let problem = if self.is_closed() {
+                Option::Some(pool_closed())
+            } else {
+                ctx.and_then(|ctx| ctx.error().map(pool_context_error))
+            };
+            if let Some(error) = problem {
+                let _ = self.release(connection);
+                return Result::Err(error)
+            }
+            return Result::Ok(connection)
+        }
     }
 
     fn release(self: SqlitePool, connection: SqliteConnection) -> Result[(), Error] {
@@ -87,18 +207,22 @@ impl SqlitePool {
                 ),
             )
         }
-        if !self.closed.get() && self.idle.len() < self.policy.max_idle {
+        let _ = self.gate.recv();
+        if !self.is_closed() && self.idle.len() < self.policy.max_idle {
             self.idle.push(connection.unleased());
+            self.notify();
+            self.gate.send(());
             return Result::Ok(())
         }
+        self.gate.send(());
         let result = connection.database.close().map_err(convert_error);
-        self.opened.set(self.opened.get() - 1);
+        self.free_capacity();
         result
     }
 
     fn discard(self: SqlitePool, connection: SqliteConnection, reason: Error) -> Result[(), Error] {
         let cleanup = connection.database.close().map_err(convert_error);
-        self.opened.set(self.opened.get() - 1);
+        self.free_capacity();
         match cleanup {
             Ok(_) => Result::Err(reason),
             Err(error) => Result::Err(
@@ -115,7 +239,23 @@ impl SqlitePool {
         T,
         Error,
     ] {
-        let connection = self.acquire()?;
+        self.run_connection(Option::None, callback)
+    }
+
+    pub fn with_connection_with_context[T](
+        self: SqlitePool,
+        ctx: context::Context,
+        callback: (SqliteConnection) -> Result[T, Error],
+    ) -> Result[T, Error] {
+        self.run_connection(Option::Some(ctx), callback)
+    }
+
+    fn run_connection[T](
+        self: SqlitePool,
+        ctx: Option[context::Context],
+        callback: (SqliteConnection) -> Result[T, Error],
+    ) -> Result[T, Error] {
+        let connection = self.acquire(ctx)?;
         let released = Ref::new(false);
         defer {
             if !released.get() {
@@ -160,16 +300,57 @@ impl SqlitePool {
         self.with_connection(|connection| connection.query_one(query))
     }
 
+    pub fn execute_with_context(self: SqlitePool, ctx: context::Context, query: Query) -> Result[
+        Execution,
+        Error,
+    ] {
+        self.with_connection_with_context(ctx, |connection| connection.execute(query))
+    }
+
+    pub fn query_all_with_context[T: FromRow](self: SqlitePool, ctx: context::Context, query: Query) -> Result[
+        Vec[T],
+        Error,
+    ] {
+        let max_rows = self.policy.max_result_rows;
+        self.with_connection_with_context(ctx, |connection| connection.query_all(query, max_rows))
+    }
+
+    pub fn query_optional_with_context[T: FromRow](
+        self: SqlitePool,
+        ctx: context::Context,
+        query: Query,
+    ) -> Result[Option[T], Error] {
+        self.with_connection_with_context(ctx, |connection| connection.query_optional(query))
+    }
+
+    pub fn query_one_with_context[T: FromRow](self: SqlitePool, ctx: context::Context, query: Query) -> Result[
+        T,
+        Error,
+    ] {
+        self.with_connection_with_context(ctx, |connection| connection.query_one(query))
+    }
+
     pub fn close(self: SqlitePool) -> Result[(), Error] {
-        self.closed.set(true);
-        let mut failure: Option[Error] = Option::None;
+        let _ = self.close_gate.recv();
+        defer self.close_gate.send(());
+        let connections: Vec[SqliteConnection] = Vec::new();
+        let _ = self.gate.recv();
+        if !self.is_closed() {
+            self.closed.close();
+        }
         while let Some(connection) = self.idle.pop() {
+            connections.push(connection);
+        }
+        self.notify();
+        self.gate.send(());
+        let mut failure: Option[Error] = Option::None;
+        for connection in connections {
             if let Err(error) = connection.close() {
                 if failure.is_none() {
                     failure = Option::Some(error);
                 }
             }
-            self.opened.set(self.opened.get() - 1);
+            self.free_capacity();
         }
         match failure {
             Some(error) => Result::Err(error),

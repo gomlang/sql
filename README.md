@@ -37,28 +37,63 @@ transaction isolation, cancellation and connection serialization to
 `ecosystem::sqlite`.
 
 `PoolPolicy` validates `max_open` (1..64), `max_idle` (0..max_open) and
-`max_result_rows` (0..1,048,576). `sqlite::SqlitePool` opens connections lazily,
-returns `Busy` when `max_open` is reached, reuses up to `max_idle` connections,
-and closes excess idle connections. `with_connection(callback)` scopes one
-lease; `execute`, `query_all`, `query_optional` and `query_one` are short
-convenience leases, with `max_result_rows` applied to `query_all`. `stats()`
-reports open, idle and in-use counts. `close()` closes idle connections and
-marks the pool closed; active leases close when returned. Callbacks must close
-their cursors, leave the connection open, and not retain its handle after
-returning. On return, a connection with any live statement, cursor or
-transaction is closed rather than reused; outstanding transactions roll back.
-A callback that closed its connection also causes the pool to discard it.
-`with_connection` returns a recoverable cleanup error describing the invalid
-lease state, even when the callback itself succeeded. The pool then opens a
-fresh connection for the next lease. Each lease also has a separate validity
-token: a copied connection retained by the callback returns `Closed` for
-queries, transactions and close after the callback returns, including while
-the same physical connection serves a later lease.
+`max_result_rows` (0..1,048,576). `sqlite::SqlitePool` is safe to share between
+parallel tasks. It opens connections lazily, reserves capacity before opening,
+reuses up to `max_idle` connections, and closes excess idle connections. Calls
+to the backend do not hold the pool's bookkeeping lock. `stats()` reports open,
+idle and in-use counts; connections being opened or closed count as in use
+until that work finishes. A `:memory:` data source creates a separate database
+for each physical connection, so use `max_open = 1` for a single in-memory
+database or a shared file data source for a multi-connection pool.
 
-The pool is serial-use policy, with no wait queue, acquisition timeout or
-synchronization across parallel tasks. It refuses an exhausted pool
-immediately. Applications needing concurrent sharing must provide their own
-serialization or a future synchronized pool implementation.
+`with_connection(callback)` scopes one lease and returns `Busy` immediately
+when capacity is exhausted, preserving its existing behavior. `execute`,
+`query_all`, `query_optional` and `query_one` use the same immediate acquisition;
+`max_result_rows` applies to `query_all`.
+
+`with_connection_with_context(ctx, callback)` waits for capacity until a lease
+is available, the context is cancelled (`Cancelled`), its deadline expires
+(`Timeout`), or the pool closes (`Closed`). Returning or discarding a connection
+wakes waiting tasks. Waiting order is not guaranteed. The corresponding
+`execute_with_context`, `query_all_with_context`, `query_optional_with_context`
+and `query_one_with_context` take `(ctx, query)`. The context controls pool
+acquisition, including checks before and after opening a connection; it does
+not interrupt native connection opening or SQL execution after checkout.
+Use `std::context::with_timeout` or `with_deadline` to bound a wait. A nested
+waiting acquisition needs enough pool capacity or a deadline to avoid waiting
+for the outer callback to release its own connection.
+
+```goml
+use ecosystem::sql::sqlite::SqlitePool;
+use ecosystem::sql::{Error, Query, Execution};
+use std::context;
+use std::time;
+
+fn execute_when_available(pool: SqlitePool, query: Query) -> Result[Execution, Error] {
+    context::with_timeout(
+        context::Context::background(),
+        time::Duration::from_seconds(1),
+        |ctx, _| pool.execute_with_context(ctx, query),
+    )
+}
+```
+
+`close()` rejects and wakes new or waiting acquisitions, closes idle
+connections, and lets active callbacks finish. Active leases close when
+returned. Callbacks must close their cursors, leave the connection open, and
+finish any child tasks using the lease before returning. On return, a
+connection with a live statement, cursor or transaction is closed rather than
+reused; outstanding transactions roll back. A callback that closed its
+connection also causes the pool to discard it. Cleanup errors remain
+recoverable and are appended to an existing callback error without replacing
+its category. The pool can open a fresh connection for the next lease.
+
+A lease's validity is synchronized with its connection, cursor and transaction
+calls. Return waits for a call already in progress, then expires the lease
+before checking resources or reusing the physical connection. Retained handles
+return `Closed` after expiration and cannot act on a later lease. This runtime
+check also covers copied handles shared between tasks; it does not make
+retaining a lease beyond the callback a supported usage pattern.
 
 The module and native downstream fixture use the native SQLite adapter mapping
 and pinned Go dependencies described in the [SQLite README](../sqlite/README.md).
