@@ -1,0 +1,53 @@
+package tests;
+
+use ecosystem::sql::{CollectionLimits, Query, Params, PoolPolicy, Row, Error, ErrorKind, Executor};
+use ecosystem::sql::sqlite::{SqliteDriver, SqlitePool};
+use std::testing;
+
+fn budget_query(text: string) -> Query {
+    testing::expect_ok(Query::new(text, Params::empty()), "query")
+}
+
+#[test]
+fn public_collection_budget_releases_native_cursor_and_pool_lease() -> () {
+    let pool = testing::expect_ok(
+        SqlitePool::new(SqliteDriver::new(), ":memory:", PoolPolicy::standard()),
+        "pool",
+    );
+    defer {
+        let _ = pool.close();
+    };
+    let _ = testing::expect_ok(pool.execute(budget_query("CREATE TABLE kept(n INTEGER)")), "create");
+    let limited: Result[Vec[Row], Error] = pool.with_connection(
+        |connection| connection.query_all_with_limits(
+            budget_query("SELECT zeroblob(4096)"),
+            CollectionLimits { max_rows: 1, max_bytes: 4095 },
+        ),
+    );
+    testing::assert_eq(testing::expect_err(limited, "native payload cap").kind, ErrorKind::Limit);
+    testing::assert_eq(pool.stats().idle, 1);
+    let invalid: Result[Vec[Row], Error] = pool.with_connection(
+        |connection| connection.query_all_with_limits(
+            budget_query("INSERT INTO kept VALUES(1) RETURNING n"),
+            CollectionLimits { max_rows: 1, max_bytes: -1 },
+        ),
+    );
+    testing::assert_eq(testing::expect_err(invalid, "reject before SQL").kind, ErrorKind::Limit);
+    let count: Row = testing::expect_ok(
+        pool.query_one(budget_query("SELECT count(*) FROM kept")),
+        "same physical database retained",
+    );
+    let value: i64 = testing::expect_ok(count.get(0), "count");
+    testing::assert_eq(value, 0);
+    let exact: Vec[Row] = testing::expect_ok(
+        pool.with_connection(
+            |connection| connection.query_all_with_limits(
+                budget_query("SELECT zeroblob(4096)"),
+                CollectionLimits { max_rows: 1, max_bytes: 4096 },
+            ),
+        ),
+        "exact native payload",
+    );
+    testing::assert_eq(exact.len(), 1);
+    testing::assert_eq(pool.stats().idle, 1);
+}

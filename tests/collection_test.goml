@@ -1,0 +1,116 @@
+package tests;
+
+use ecosystem::sql::{CollectionLimits, Row, Column, Value, Error, ErrorKind, Executor};
+use std::bytes::{Bytes};
+use std::testing;
+
+fn payload_row() -> Row {
+    let values = Vec::from_array(
+        [
+            Value::Null,
+            Value::Integer(-9223372036854775808),
+            Value::Real(1.25),
+            Value::Text("中"),
+            Value::TextBytes(Bytes::from_vec(Vec::from_array([255, 0]))),
+            Value::Blob(Bytes::from_vec(Vec::from_array([1, 2, 3]))),
+        ],
+    );
+    let columns = Vec::new();
+    for _ in values {
+        columns.push(Column { name: "value", declared_type: "" });
+    }
+    testing::expect_ok(Row::new(columns, values), "payload row")
+}
+
+#[test]
+fn collection_payload_budget_counts_all_value_classes_and_rows() -> () {
+    let executor = MockExecutor {
+        rows: Vec::from_array([payload_row(), payload_row()]),
+        closes: Ref::new(0),
+        fail_close: false,
+        fail_next: false,
+    };
+    let exact: Vec[Row] = testing::expect_ok(
+        executor.query_all_with_limits(
+            cursor_query(),
+            CollectionLimits { max_rows: 2, max_bytes: 48 },
+        ),
+        "exact cumulative budget",
+    );
+    testing::assert_eq(exact.len(), 2);
+    let short: Result[Vec[Row], Error] = executor.query_all_with_limits(
+        cursor_query(),
+        CollectionLimits { max_rows: 2, max_bytes: 47 },
+    );
+    testing::assert_eq(testing::expect_err(short, "one byte short").kind, ErrorKind::Limit);
+    let row_limited: Result[Vec[Row], Error] = executor.query_all_with_limits(
+        cursor_query(),
+        CollectionLimits { max_rows: 1, max_bytes: 9223372036854775807 },
+    );
+    testing::assert_eq(
+        testing::expect_err(row_limited, "row cap still applies").kind,
+        ErrorKind::Limit,
+    );
+    testing::assert_eq(executor.closes.get(), 3);
+}
+
+#[test]
+fn collection_budget_precedes_conversion_and_retains_cleanup_failure() -> () {
+    let executor = MockExecutor {
+        rows: Vec::from_array([payload_row()]),
+        closes: Ref::new(0),
+        fail_close: true,
+        fail_next: false,
+    };
+    let result: Result[Vec[PanicRow], Error] = executor.query_all_with_limits(
+        cursor_query(),
+        CollectionLimits { max_rows: 1, max_bytes: 23 },
+    );
+    let error = testing::expect_err(result, "reject before panicking decoder");
+    testing::assert_eq(error.kind, ErrorKind::Limit);
+    testing::assert(error.message.contains("byte limit"));
+    testing::assert(error.message.contains("cursor cleanup: cursor close failed"));
+    testing::assert_eq(executor.closes.get(), 1);
+}
+
+#[test]
+fn collection_invalid_and_zero_limits_have_defined_boundaries() -> () {
+    let executor = MockExecutor {
+        rows: Vec::new(),
+        closes: Ref::new(0),
+        fail_close: false,
+        fail_next: false,
+    };
+    for limits in Vec::from_array(
+        [
+            CollectionLimits { max_rows: -1, max_bytes: 0 },
+            CollectionLimits { max_rows: 1048577, max_bytes: 0 },
+            CollectionLimits { max_rows: 0, max_bytes: -1 },
+        ],
+    ) {
+        let result: Result[Vec[Row], Error] = executor.query_all_with_limits(cursor_query(), limits);
+        testing::assert_eq(testing::expect_err(result, "invalid budget").kind, ErrorKind::Limit);
+    }
+    testing::assert_eq(executor.closes.get(), 0);
+    let empty: Vec[Row] = testing::expect_ok(
+        executor.query_all_with_limits(
+            cursor_query(),
+            CollectionLimits { max_rows: 0, max_bytes: 0 },
+        ),
+        "empty fits",
+    );
+    testing::assert(empty.is_empty());
+    let row = testing::expect_ok(
+        Row::new(
+            Vec::from_array([Column { name: "empty", declared_type: "" }]),
+            Vec::from_array([Value::Null]),
+        ),
+        "null row",
+    );
+    let nulls = MockExecutor { rows: Vec::from_array([row]), closes: Ref::new(0), ..executor };
+    let result: Vec[Row] = testing::expect_ok(
+        nulls.query_all_with_limits(cursor_query(), CollectionLimits { max_rows: 1, max_bytes: 0 }),
+        "null costs zero",
+    );
+    testing::assert_eq(result.len(), 1);
+}
