@@ -14,6 +14,11 @@ fn published_sql_contract_over_sqlite_backend() -> () {
 }
 
 #[test]
+fn published_sql_migrations_upgrade_existing_data_and_detect_drift() -> () {
+    testing::assert_ok(sql::exercise_migrations());
+}
+
+#[test]
 fn published_sql_pool_supports_concurrent_context_checkout() -> () {
     let pool = testing::expect_ok(
         SqlitePool::new(SqliteDriver::new(), ":memory:", database::PoolPolicy::standard()),

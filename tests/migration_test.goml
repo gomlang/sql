@@ -1,0 +1,418 @@
+package tests;
+
+use ecosystem::sql::{Connection, Transaction, Executor, Driver, Query, Params, Row, ErrorKind, TransactionMode};
+use ecosystem::sql::sqlite::{SqliteDriver, SqliteConnection};
+use ecosystem::sql::migration::{Migration, Migrator, Report};
+use std::task;
+use std::testing;
+use std::fs;
+use std::time;
+
+fn migration(version: i64, name: string, statements: Vec[string]) -> Migration {
+    testing::expect_ok(Migration::new(version, name, statements), "migration definition")
+}
+
+fn migrator(values: Vec[Migration]) -> Migrator {
+    testing::expect_ok(Migrator::new(values), "migration plan")
+}
+
+fn migration_query(statement: string) -> Query {
+    testing::expect_ok(Query::new(statement, Params::empty()), "migration query")
+}
+
+fn migration_scalar(connection: SqliteConnection, statement: string) -> i64 {
+    let row: Row = testing::expect_ok(
+        connection.query_one(migration_query(statement)),
+        "scalar row",
+    );
+    testing::expect_ok(row.get(0), "scalar")
+}
+
+fn initial_migration() -> Migration {
+    migration(1, "create jobs", Vec::from_array(["CREATE TABLE jobs(id INTEGER PRIMARY KEY)"]))
+}
+
+#[test]
+fn migration_definitions_snapshot_and_checksum_with_explicit_bounds() -> () {
+    let statements = Vec::from_array(["CREATE TABLE jobs(id INTEGER PRIMARY KEY)"]);
+    let value = migration(1, "create jobs", statements);
+    testing::assert_eq(
+        value.checksum(),
+        "f4c22121fe8e6f33e023c5028ebccc18422517ceb5a93942a19250ebd438b69a",
+    );
+    statements[0] = "DROP TABLE jobs";
+    let copy = value.statements();
+    copy[0] = "SELECT 1";
+    testing::assert_eq(value.statements()[0], "CREATE TABLE jobs(id INTEGER PRIMARY KEY)");
+    testing::assert_err(Migration::new(0, "zero", Vec::from_array(["SELECT 1"])));
+    testing::assert_err(Migration::new(-1, "negative", Vec::from_array(["SELECT 1"])));
+    testing::assert_err(Migration::new(1, " ", Vec::from_array(["SELECT 1"])));
+    testing::assert_err(Migration::new(1, "x".repeat(257), Vec::from_array(["SELECT 1"])));
+    testing::assert_err(Migration::new(1, "empty", Vec::new()));
+    testing::assert_err(Migration::new(1, "blank", Vec::from_array([" \n "])));
+    testing::assert_err(Migration::new(1, "oversize", Vec::from_array(["x".repeat(1048577)])));
+    let too_many = Vec::new();
+    for _ in 0..1025 {
+        too_many.push("SELECT 1");
+    }
+    testing::assert_err(Migration::new(1, "many", too_many));
+    testing::assert_err(Migrator::new(Vec::from_array([value, value])));
+    let too_many_migrations = Vec::new();
+    for _ in 0..10001 {
+        too_many_migrations.push(value);
+    }
+    testing::assert_err(Migrator::new(too_many_migrations));
+    let different = migration(
+        1,
+        "create jobs",
+        Vec::from_array(["CREATE TABLE jobs(id INTEGER PRIMARY KEY) "]),
+    );
+    testing::assert(value.checksum() != different.checksum());
+}
+
+#[test]
+fn migration_status_is_read_only_and_plan_is_sorted_without_mutating_input() -> () {
+    let database = testing::expect_ok(SqliteDriver::new().memory(), "memory");
+    defer {
+        let _ = database.close();
+    };
+    let second = migration(9, "insert job", Vec::from_array(["INSERT INTO jobs VALUES(42)"]));
+    let values = Vec::from_array([second, initial_migration()]);
+    let plan = migrator(values);
+    values[1] = second;
+    let status = testing::expect_ok(plan.status_sqlite(database), "fresh status");
+    testing::assert(status.applied.is_empty());
+    testing::assert_eq(status.pending.len(), 2);
+    testing::assert_eq(status.pending[0].version(), 1);
+    testing::assert_eq(status.pending[1].version(), 9);
+    testing::assert_eq(
+        migration_scalar(
+            database,
+            "SELECT count(*) FROM sqlite_schema WHERE name='_goml_migrations'",
+        ),
+        0,
+    );
+    let report = testing::expect_ok(plan.migrate_sqlite(database), "migrate");
+    testing::assert_eq(report.previously_applied, 0);
+    testing::assert_eq(report.applied.len(), 2);
+    testing::assert_eq(report.applied[0].version, 1);
+    testing::assert_eq(report.applied[1].version, 9);
+    testing::assert_eq(migration_scalar(database, "SELECT id FROM jobs"), 42);
+    let again = testing::expect_ok(plan.migrate_sqlite(database), "repeat migration");
+    testing::assert_eq(again.previously_applied, 2);
+    testing::assert(again.applied.is_empty());
+    let status = testing::expect_ok(plan.status_sqlite(database), "applied status");
+    testing::assert_eq(status.applied.len(), 2);
+    testing::assert(status.pending.is_empty());
+}
+
+#[test]
+fn migration_upgrades_existing_database_and_preserves_rows() -> () {
+    let database = testing::expect_ok(SqliteDriver::new().memory(), "memory");
+    defer {
+        let _ = database.close();
+    };
+    testing::assert_ok(
+        database.execute(migration_query("CREATE TABLE jobs(id INTEGER PRIMARY KEY)")),
+    );
+    testing::assert_ok(database.execute(migration_query("INSERT INTO jobs VALUES(7)")));
+    let plan = migrator(
+        Vec::from_array(
+            [
+                migration(
+                    2026100301,
+                    "add job status",
+                    Vec::from_array(
+                        [
+                            "ALTER TABLE jobs ADD COLUMN complete INTEGER NOT NULL DEFAULT 0",
+                            "CREATE INDEX jobs_complete ON jobs(complete)",
+                        ],
+                    ),
+                ),
+                migration(
+                    2026100302,
+                    "finish old jobs",
+                    Vec::from_array(["UPDATE jobs SET complete = 1 WHERE id = 7"]),
+                ),
+            ],
+        ),
+    );
+    testing::assert_eq(
+        testing::expect_ok(plan.migrate_sqlite(database), "upgrade").applied.len(),
+        2,
+    );
+    testing::assert_eq(migration_scalar(database, "SELECT complete FROM jobs WHERE id=7"), 1);
+    testing::assert_eq(migration_scalar(database, "SELECT count(*) FROM jobs"), 1);
+}
+
+#[test]
+fn migration_failure_rolls_back_initial_metadata_and_entire_pending_batch() -> () {
+    let database = testing::expect_ok(SqliteDriver::new().memory(), "memory");
+    defer {
+        let _ = database.close();
+    };
+    let failed = migration(
+        2,
+        "broken insert",
+        Vec::from_array(["INSERT INTO jobs VALUES(4)", "INSERT INTO missing_table VALUES(1)"]),
+    );
+    let error = testing::expect_err(
+        migrator(Vec::from_array([initial_migration(), failed])).migrate_sqlite(database),
+        "rollback fresh batch",
+    );
+    testing::assert_eq(error.kind, ErrorKind::Backend);
+    testing::assert(error.message.contains("migration 2 (broken insert), statement 2"));
+    testing::assert(error.source.is_some());
+    testing::assert_eq(
+        migration_scalar(
+            database,
+            "SELECT count(*) FROM sqlite_schema WHERE name IN ('jobs','_goml_migrations')",
+        ),
+        0,
+    );
+    testing::assert_ok(migrator(Vec::from_array([initial_migration()])).migrate_sqlite(database));
+    testing::assert_err(
+        migrator(Vec::from_array([initial_migration(), failed])).migrate_sqlite(database),
+    );
+    testing::assert_eq(migration_scalar(database, "SELECT count(*) FROM jobs"), 0);
+    testing::assert_eq(migration_scalar(database, "SELECT count(*) FROM _goml_migrations"), 1);
+    let repaired = migration(2, "fixed insert", Vec::from_array(["INSERT INTO jobs VALUES(4)"]));
+    let result = testing::expect_ok(
+        migrator(Vec::from_array([initial_migration(), repaired])).migrate_sqlite(database),
+        "retry corrected pending migration",
+    );
+    testing::assert_eq(result.previously_applied, 1);
+    testing::assert_eq(result.applied.len(), 1);
+    testing::assert_eq(migration_scalar(database, "SELECT id FROM jobs"), 4);
+}
+
+#[test]
+fn migration_rejects_drift_removed_history_and_inserted_old_versions() -> () {
+    let database = testing::expect_ok(SqliteDriver::new().memory(), "memory");
+    defer {
+        let _ = database.close();
+    };
+    let first = migration(10, "table", Vec::from_array(["CREATE TABLE history(v INTEGER)"]));
+    let second = migration(30, "row", Vec::from_array(["INSERT INTO history VALUES(1)"]));
+    testing::assert_ok(migrator(Vec::from_array([second, first])).migrate_sqlite(database));
+    let changed = migration(10, "table", Vec::from_array(["CREATE TABLE history(v TEXT)"]));
+    let changed_name = migration(10, "renamed", first.statements());
+    let extra = migration(20, "inserted later", Vec::from_array(["INSERT INTO history VALUES(2)"]));
+    let pending = migration(40, "pending", Vec::from_array(["INSERT INTO history VALUES(3)"]));
+    for definitions in Vec::from_array(
+        [
+            Vec::from_array([changed, second, pending]),
+            Vec::from_array([changed_name, second]),
+            Vec::from_array([first]),
+            Vec::from_array([second]),
+            Vec::from_array([first, extra, second]),
+            Vec::new(),
+        ],
+    ) {
+        let plan = migrator(definitions);
+        testing::assert_eq(
+            testing::expect_err(plan.status_sqlite(database), "invalid history status").kind,
+            ErrorKind::Argument,
+        );
+        testing::assert_eq(
+            testing::expect_err(plan.migrate_sqlite(database), "invalid history apply").kind,
+            ErrorKind::Argument,
+        );
+        testing::assert_eq(migration_scalar(database, "SELECT count(*) FROM history"), 1);
+        testing::assert_eq(migration_scalar(database, "SELECT count(*) FROM _goml_migrations"), 2);
+    }
+}
+
+#[test]
+fn migration_rejects_transaction_control_multiple_statements_and_history_damage() -> () {
+    let database = testing::expect_ok(SqliteDriver::new().memory(), "memory");
+    defer {
+        let _ = database.close();
+    };
+    testing::assert_ok(migrator(Vec::from_array([initial_migration()])).migrate_sqlite(database));
+    for bad in Vec::from_array(
+        [
+            "/* control */ COMMIT",
+            "INSERT INTO jobs VALUES(1); INSERT INTO jobs VALUES(2)",
+            "DELETE FROM main._goml_migrations",
+            "DROP TABLE main._goml_migrations",
+        ],
+    ) {
+        let next = migration(2, "invalid", Vec::from_array(["INSERT INTO jobs VALUES(10)", bad]));
+        testing::assert_err(
+            migrator(Vec::from_array([initial_migration(), next])).migrate_sqlite(database),
+        );
+        testing::assert_eq(migration_scalar(database, "SELECT count(*) FROM jobs"), 0);
+        testing::assert_eq(migration_scalar(database, "SELECT count(*) FROM _goml_migrations"), 1);
+    }
+}
+
+#[test]
+fn migration_write_lock_prevents_competing_runner_and_retry_is_idempotent() -> () {
+    testing::assert_ok(fs::create_dir_all("_artifact"));
+    let path = "_artifact/migration-lock-" + time::SystemTime::now().unix_nanoseconds().to_string()
+        + ".sqlite";
+    defer {
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(path + "-journal");
+    };
+    let first = testing::expect_ok(SqliteDriver::new().connect(path), "first connection");
+    defer {
+        let _ = first.close();
+    };
+    let second = testing::expect_ok(SqliteDriver::new().connect(path), "second connection");
+    defer {
+        let _ = second.close();
+    };
+    let _: Row = testing::expect_ok(
+        first.query_one(migration_query("PRAGMA busy_timeout=0")),
+        "first busy policy",
+    );
+    let _: Row = testing::expect_ok(
+        second.query_one(migration_query("PRAGMA busy_timeout=0")),
+        "second busy policy",
+    );
+    let plan = migrator(
+        Vec::from_array(
+            [
+                initial_migration(),
+                migration(2, "row", Vec::from_array(["INSERT INTO jobs VALUES(1)"])),
+            ],
+        ),
+    );
+    let held = testing::expect_ok(first.begin(TransactionMode::Immediate), "write lock");
+    let blocked = testing::expect_err(plan.migrate_sqlite(second), "competing writer");
+    testing::assert_eq(blocked.kind, ErrorKind::Busy);
+    testing::assert(blocked.message.contains("acquire migration write transaction"));
+    testing::assert_ok(held.rollback());
+    let reports: Vec[Report] = Vec::new();
+    task::scope(
+        |scope| {
+            let a = scope.spawn(|_| plan.migrate_sqlite(first));
+            let b = scope.spawn(|_| plan.migrate_sqlite(second));
+            let results = Vec::from_array([a.join(), b.join()]);
+            for result in results {
+                match result {
+                    Ok(report) => reports.push(report),
+                    Err(error) => testing::assert_eq(error.kind, ErrorKind::Busy),
+                }
+            }
+        },
+    );
+    let mut count = 0;
+    for report in reports {
+        count = count + report.applied.len();
+    }
+    testing::assert_eq(count, 2);
+    testing::assert(
+        testing::expect_ok(plan.migrate_sqlite(second), "retry competing runner").applied.is_empty(),
+    );
+    testing::assert_eq(migration_scalar(first, "SELECT count(*) FROM jobs"), 1);
+    testing::assert_eq(migration_scalar(first, "SELECT count(*) FROM _goml_migrations"), 2);
+}
+
+#[test]
+fn migration_rejects_disabled_journaling_and_closed_connections() -> () {
+    let database = testing::expect_ok(SqliteDriver::new().memory(), "memory");
+    defer {
+        let _ = database.close();
+    };
+    let _: Row = testing::expect_ok(
+        database.query_one(migration_query("PRAGMA journal_mode=OFF")),
+        "disable journal",
+    );
+    let plan = migrator(Vec::from_array([initial_migration()]));
+    testing::assert_eq(
+        testing::expect_err(plan.migrate_sqlite(database), "no rollback journal").kind,
+        ErrorKind::Argument,
+    );
+    testing::assert_eq(
+        migration_scalar(
+            database,
+            "SELECT count(*) FROM sqlite_schema WHERE name='_goml_migrations'",
+        ),
+        0,
+    );
+    testing::assert_ok(database.close());
+    testing::assert_eq(
+        testing::expect_err(plan.status_sqlite(database), "closed status").kind,
+        ErrorKind::Closed,
+    );
+    testing::assert_eq(
+        testing::expect_err(plan.migrate_sqlite(database), "closed migration").kind,
+        ErrorKind::Closed,
+    );
+}
+
+#[test]
+fn migration_commit_failure_rolls_back_deferred_foreign_key_violation() -> () {
+    let database = testing::expect_ok(SqliteDriver::new().memory(), "memory");
+    defer {
+        let _ = database.close();
+    };
+    let plan = migrator(
+        Vec::from_array(
+            [
+                migration(
+                    1,
+                    "deferred foreign key",
+                    Vec::from_array(
+                        [
+                            "CREATE TABLE parents(id INTEGER PRIMARY KEY)",
+                            "CREATE TABLE children(parent_id INTEGER REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED)",
+                            "INSERT INTO children VALUES(9)",
+                        ],
+                    ),
+                ),
+            ],
+        ),
+    );
+    let error = testing::expect_err(plan.migrate_sqlite(database), "failed commit");
+    testing::assert_eq(error.kind, ErrorKind::Backend);
+    testing::assert(error.message.contains("migration transaction commit failed"));
+    testing::assert_eq(
+        migration_scalar(
+            database,
+            "SELECT count(*) FROM sqlite_schema WHERE name IN ('parents','children','_goml_migrations')",
+        ),
+        0,
+    );
+    testing::assert_ok(migrator(Vec::from_array([initial_migration()])).migrate_sqlite(database));
+}
+
+#[test]
+fn migration_qualifies_main_history_and_rejects_reserved_view() -> () {
+    let database = testing::expect_ok(SqliteDriver::new().memory(), "memory");
+    defer {
+        let _ = database.close();
+    };
+    testing::assert_ok(
+        database.execute(migration_query("CREATE TEMP TABLE _goml_migrations(version INTEGER)")),
+    );
+    testing::assert_ok(
+        database.execute(migration_query("INSERT INTO temp._goml_migrations VALUES(100)")),
+    );
+    let plan = migrator(Vec::from_array([initial_migration()]));
+    testing::assert_eq(
+        testing::expect_ok(plan.status_sqlite(database), "ignore temporary history").pending.len(),
+        1,
+    );
+    testing::assert_eq(
+        testing::expect_ok(plan.migrate_sqlite(database), "use main history").applied.len(),
+        1,
+    );
+    testing::assert_eq(migration_scalar(database, "SELECT version FROM main._goml_migrations"), 1);
+    testing::assert_eq(migration_scalar(database, "SELECT version FROM temp._goml_migrations"), 100);
+    let other = testing::expect_ok(SqliteDriver::new().memory(), "other");
+    defer {
+        let _ = other.close();
+    };
+    testing::assert_ok(
+        other.execute(migration_query("CREATE VIEW _goml_migrations AS SELECT 1 AS version")),
+    );
+    testing::assert_eq(
+        testing::expect_err(plan.status_sqlite(other), "reserved view").kind,
+        ErrorKind::Argument,
+    );
+    testing::assert_err(plan.migrate_sqlite(other));
+}
