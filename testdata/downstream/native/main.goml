@@ -42,5 +42,7 @@ pub fn exercise() -> Result[(), Error] {
 
 fn main() -> () {
     testing::expect_ok(exercise(), "SQL consumer");
+    testing::expect_ok(exercise_migrations(), "SQL migration consumer");
     println("sql consumer: typed row and transaction passed");
+    println("sql migration consumer: upgrade, idempotency, drift and rollback passed");
 }

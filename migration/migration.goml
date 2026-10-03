@@ -1,0 +1,335 @@
+package migration;
+
+use ecosystem::sql::{Connection, Transaction, Executor, Query, Params, Value, Row, FromRow, Error, ErrorKind, TransactionMode};
+use ecosystem::sql::sqlite::{SqliteConnection};
+use std::bytes::{Bytes};
+use std::crypto::hash;
+use std::text::{StringBuilder};
+
+pub struct Migration {
+    version_value: i64,
+    name_value: string,
+    statements_value: Vec[string],
+    checksum_value: string,
+    bytes_value: isize,
+}
+
+fn field(builder: StringBuilder, value: string) -> () {
+    builder.write_string(value.byte_len().to_string());
+    builder.write_string(":");
+    builder.write_string(value);
+}
+
+impl Migration {
+    pub fn new(version: i64, name: string, statements: Vec[string]) -> Result[Migration, Error] {
+        if version <= 0 || name.trim().byte_len() == 0 || name.byte_len() > 256 {
+            return Result::Err(
+                Error::new(
+                    ErrorKind::Argument,
+                    "migration requires a positive version and a name of 1 through 256 bytes",
+                ),
+            )
+        }
+        if statements.is_empty() || statements.len() > 1024 {
+            return Result::Err(
+                Error::new(ErrorKind::Limit, "migration requires 1 through 1024 statements"),
+            )
+        }
+        let mut total = 0;
+        for statement in statements {
+            if statement.trim().byte_len() == 0 || statement.byte_len() > 1048576 {
+                return Result::Err(
+                    Error::new(
+                        ErrorKind::Argument,
+                        "migration statement must contain 1 through 1048576 bytes",
+                    ),
+                )
+            }
+            total = total + statement.byte_len();
+            if total > 16777216 {
+                return Result::Err(Error::new(ErrorKind::Limit, "migration SQL exceeds 16 MiB"))
+            }
+        }
+        let builder = StringBuilder::new();
+        builder.write_string("goml.sql.migration.v1:");
+        field(builder, version.to_string());
+        field(builder, name);
+        field(builder, statements.len().to_string());
+        for statement in statements {
+            field(builder, statement);
+        }
+        Result::Ok(
+            Migration {
+                version_value: version,
+                name_value: name,
+                statements_value: statements.copy(),
+                checksum_value: hash::sha256(Bytes::from_string(builder.finish())),
+                bytes_value: total,
+            },
+        )
+    }
+
+    pub fn version(self: Migration) -> i64 {
+        self.version_value
+    }
+
+    pub fn name(self: Migration) -> string {
+        self.name_value
+    }
+
+    pub fn statements(self: Migration) -> Vec[string] {
+        self.statements_value.copy()
+    }
+
+    pub fn checksum(self: Migration) -> string {
+        self.checksum_value
+    }
+}
+
+pub struct Applied {
+    pub version: i64,
+    pub name: string,
+    pub checksum: string,
+}
+
+impl FromRow for Applied {
+    fn from_row(row: Row) -> Result[Applied, Error] {
+        Result::Ok(Applied { version: row.get(0)?, name: row.get(1)?, checksum: row.get(2)? })
+    }
+}
+
+pub struct Status {
+    pub applied: Vec[Applied],
+    pub pending: Vec[Migration],
+}
+
+pub struct Report {
+    pub previously_applied: isize,
+    pub applied: Vec[Applied],
+}
+
+pub struct Migrator {
+    migrations: Vec[Migration],
+}
+
+fn query(statement: string) -> Result[Query, Error] {
+    Query::new(statement, Params::empty())
+}
+
+fn annotate(error: Error, message: string) -> Error {
+    Error { message: message + ": " + error.message, ..error }
+}
+
+fn finish[T: Transaction, R](transaction: T, result: Result[R, Error]) -> Result[R, Error] {
+    let result = match result {
+        Ok(value) => match transaction.commit() {
+            Ok(_) => return Result::Ok(value),
+            Err(error) => annotate(error, "migration transaction commit failed"),
+        },
+        Err(error) => error,
+    };
+    match transaction.rollback() {
+        Ok(_) => Result::Err(result),
+        Err(cleanup) => Result::Err(
+            Error {
+                message: result.message + "; rollback failed: " + cleanup.to_string(),
+                ..result,
+            },
+        ),
+    }
+}
+
+impl Migrator {
+    pub fn new(migrations: Vec[Migration]) -> Result[Migrator, Error] {
+        if migrations.len() > 10000 {
+            return Result::Err(
+                Error::new(ErrorKind::Limit, "migration history exceeds 10000 entries"),
+            )
+        }
+        let ordered = migrations.copy();
+        ordered.sort_by(
+            |left, right| {
+                if left.version() < right.version() {
+                    -1
+                } else if left.version() > right.version() {
+                    1
+                } else {
+                    0
+                }
+            },
+        );
+        let mut previous: i64 = 0;
+        let mut total = 0;
+        for migration in ordered {
+            if migration.version() == previous {
+                return Result::Err(
+                    Error::new(
+                        ErrorKind::Argument,
+                        "duplicate migration version " + previous.to_string(),
+                    ),
+                )
+            }
+            previous = migration.version();
+            total = total + migration.bytes_value;
+            if total > 67108864 {
+                return Result::Err(
+                    Error::new(ErrorKind::Limit, "migration plan SQL exceeds 64 MiB"),
+                )
+            }
+        }
+        Result::Ok(Migrator { migrations: ordered })
+    }
+
+    fn inspect[E: Executor](self: Migrator, executor: E) -> Result[Status, Error] {
+        let rows: Vec[Row] = executor.query_all(
+            query("SELECT type FROM main.sqlite_schema WHERE name = '_goml_migrations'")?,
+            1,
+        )?;
+        let applied: Vec[Applied] = if rows.is_empty() {
+            Vec::new()
+        } else {
+            let object_type: string = rows[0].get(0)?;
+            if object_type != "table" {
+                return Result::Err(
+                    Error::new(
+                        ErrorKind::Argument,
+                        "reserved migration history object must be a table",
+                    ),
+                )
+            }
+            executor.query_all_with_limits(
+                query("SELECT version, name, checksum FROM main._goml_migrations ORDER BY version")?,
+                ecosystem::sql::CollectionLimits { max_rows: 10000, max_bytes: 4000000 },
+            )?
+        };
+        if applied.len() > self.migrations.len() {
+            return Result::Err(
+                Error::new(
+                    ErrorKind::Argument,
+                    "database migration history is newer than this plan; restore the complete applied migration definitions",
+                ),
+            )
+        }
+        for index in 0..applied.len() {
+            let actual = applied[index];
+            let expected = self.migrations[index];
+            if actual.version != expected.version() {
+                return Result::Err(
+                    Error::new(
+                        ErrorKind::Argument,
+                        "migration history is not a prefix of this plan at version "
+                            + actual.version.to_string()
+                            + "; restore missing definitions and append new versions after applied migrations",
+                    ),
+                )
+            }
+            if actual.name != expected.name() || actual.checksum != expected.checksum() {
+                return Result::Err(
+                    Error::new(
+                        ErrorKind::Argument,
+                        "migration drift at version " + actual.version.to_string()
+                            + "; restore the applied definition and add a new migration for changes",
+                    ),
+                )
+            }
+        }
+        let pending = Vec::new();
+        for index in applied.len()..self.migrations.len() {
+            pending.push(self.migrations[index]);
+        }
+        Result::Ok(Status { applied, pending })
+    }
+
+    pub fn status_sqlite(self: Migrator, connection: SqliteConnection) -> Result[Status, Error] {
+        let transaction = connection.begin(TransactionMode::Deferred)?;
+        let done = Ref::new(false);
+        defer {
+            if !done.get() {
+                let _ = transaction.rollback();
+            }
+        };
+        let result = finish(transaction, self.inspect(transaction));
+        done.set(true);
+        result
+    }
+
+    fn apply[T: Transaction](self: Migrator, transaction: T) -> Result[Report, Error] {
+        let journal: Row = transaction.query_one(query("PRAGMA main.journal_mode")?)?;
+        let mode: string = journal.get(0)?;
+        if mode == "off" {
+            return Result::Err(
+                Error::new(
+                    ErrorKind::Argument,
+                    "migrations require SQLite rollback journaling; journal_mode=OFF is unsupported",
+                ),
+            )
+        }
+        transaction.execute(
+            query(
+                "CREATE TABLE IF NOT EXISTS main._goml_migrations (version INTEGER PRIMARY KEY CHECK(version > 0), name TEXT NOT NULL, checksum TEXT NOT NULL CHECK(length(checksum) = 64))",
+            )?,
+        )?;
+        let status = self.inspect(transaction)?;
+        let applied = Vec::new();
+        for migration in status.pending {
+            for index in 0..migration.statements_value.len() {
+                transaction.execute(query(migration.statements_value[index])?).map_err(
+                    |error| annotate(
+                        error,
+                        "migration " + migration.version().to_string() + " (" + migration.name()
+                            + "), statement "
+                            + (index + 1).to_string(),
+                    ),
+                )?;
+            }
+            transaction.execute(
+                Query::new(
+                    "INSERT INTO main._goml_migrations(version, name, checksum) VALUES (?, ?, ?)",
+                    Params::positional(
+                        Vec::from_array(
+                            [
+                                Value::Integer(migration.version()),
+                                Value::Text(migration.name()),
+                                Value::Text(migration.checksum()),
+                            ],
+                        ),
+                    ),
+                )?,
+            ).map_err(
+                |error| annotate(error, "record migration " + migration.version().to_string()),
+            )?;
+            applied.push(
+                Applied {
+                    version: migration.version(),
+                    name: migration.name(),
+                    checksum: migration.checksum(),
+                },
+            );
+        }
+        let final_status = self.inspect(transaction)?;
+        if !final_status.pending.is_empty() {
+            return Result::Err(
+                Error::new(
+                    ErrorKind::Argument,
+                    "migration statements changed reserved migration history",
+                ),
+            )
+        }
+        Result::Ok(Report { previously_applied: status.applied.len(), applied })
+    }
+
+    pub fn migrate_sqlite(self: Migrator, connection: SqliteConnection) -> Result[Report, Error] {
+        let transaction = connection.begin(TransactionMode::Immediate).map_err(
+            |error| annotate(error, "acquire migration write transaction"),
+        )?;
+        let done = Ref::new(false);
+        defer {
+            if !done.get() {
+                let _ = transaction.rollback();
+            }
+        };
+        let result = finish(transaction, self.apply(transaction));
+        done.set(true);
+        result
+    }
+}

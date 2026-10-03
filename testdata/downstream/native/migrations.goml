@@ -1,0 +1,62 @@
+package main;
+
+use ecosystem::sql::{Connection, Executor, Query, Params, Row, Error};
+use ecosystem::sql::sqlite::{SqliteDriver};
+use ecosystem::sql::migration::{Migration, Migrator};
+use std::testing;
+
+pub fn exercise_migrations() -> Result[(), Error] {
+    let database = SqliteDriver::new().memory()?;
+    defer {
+        let _ = database.close();
+    };
+    database.execute(
+        Query::new(
+            "CREATE TABLE accounts(id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            Params::empty(),
+        )?,
+    )?;
+    database.execute(Query::new("INSERT INTO accounts VALUES(1, 'Ada')", Params::empty())?)?;
+    let schema = Migration::new(
+        1,
+        "add account state",
+        Vec::from_array(
+            [
+                "ALTER TABLE accounts ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
+                "CREATE INDEX accounts_active ON accounts(active)",
+            ],
+        ),
+    )?;
+    let plan = Migrator::new(Vec::from_array([schema]))?;
+    let before = plan.status_sqlite(database)?;
+    testing::assert(before.applied.is_empty());
+    testing::assert_eq(before.pending.len(), 1);
+    testing::assert_eq(plan.migrate_sqlite(database)?.applied.len(), 1);
+    let account: Row = database.query_one(
+        Query::new("SELECT name, active FROM accounts WHERE id=1", Params::empty())?,
+    )?;
+    let name: string = account.get_named("name")?;
+    let active: bool = account.get_named("active")?;
+    testing::assert_eq(name, "Ada");
+    testing::assert(active);
+    testing::assert(plan.migrate_sqlite(database)?.applied.is_empty());
+    let changed = Migration::new(
+        1,
+        "add account state",
+        Vec::from_array(["ALTER TABLE accounts ADD COLUMN active INTEGER NOT NULL DEFAULT 0"]),
+    )?;
+    testing::assert_err(Migrator::new(Vec::from_array([changed]))?.migrate_sqlite(database));
+    let broken = Migration::new(
+        2,
+        "atomic batch",
+        Vec::from_array(["UPDATE accounts SET active=0", "INSERT INTO absent_table VALUES(1)"]),
+    )?;
+    testing::assert_err(Migrator::new(Vec::from_array([schema, broken]))?.migrate_sqlite(database));
+    let account: Row = database.query_one(
+        Query::new("SELECT active FROM accounts WHERE id=1", Params::empty())?,
+    )?;
+    let active: bool = account.get(0)?;
+    testing::assert(active);
+    testing::assert_eq(plan.status_sqlite(database)?.applied.len(), 1);
+    Result::Ok(())
+}

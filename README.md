@@ -5,6 +5,10 @@ contract. Its nested [`sqlite`](sqlite/README.md) package adapts the existing
 `ecosystem::sqlite` backend; it does not replace the native driver or its
 connection and transaction handling.
 
+[`migration`](migration/README.md) provides versioned SQLite schema migrations,
+SHA-256 drift detection, read-only status, and atomic application of pending
+migrations. It reuses the connection and transaction contracts below.
+
 ```toml
 [dependencies]
 "ecosystem::sql" = "0.1.0"
