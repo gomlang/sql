@@ -88,8 +88,8 @@ fn native_value(value: Value) -> native::Value {
         Value::Integer(number) => native::Value::Integer(number),
         Value::Real(number) => native::Value::Real(number),
         Value::Text(text) => native::Value::Text(text),
-        Value::TextBytes(data) => native::Value::TextBytes(data.copy()),
-        Value::Blob(data) => native::Value::Blob(data.copy()),
+        Value::TextBytes(data) => native::Value::TextBytes(data),
+        Value::Blob(data) => native::Value::Blob(data),
     }
 }
 
@@ -99,8 +99,8 @@ fn sql_value(value: native::Value) -> Value {
         native::Value::Integer(number) => Value::Integer(number),
         native::Value::Real(number) => Value::Real(number),
         native::Value::Text(text) => Value::Text(text),
-        native::Value::TextBytes(data) => Value::TextBytes(data.copy()),
-        native::Value::Blob(data) => Value::Blob(data.copy()),
+        native::Value::TextBytes(data) => Value::TextBytes(data),
+        native::Value::Blob(data) => Value::Blob(data),
     }
 }
 

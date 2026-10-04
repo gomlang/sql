@@ -2,6 +2,7 @@ package tests;
 
 use ecosystem::sql::{Query, Params, Value, Row, FromRow, Error, ErrorKind, Executor, Connection, Transaction, TransactionMode};
 use ecosystem::sql::sqlite::{SqliteDriver};
+use std::bytes::{Bytes};
 use std::testing;
 
 fn query(statement: string, params: Params) -> Query {
@@ -89,4 +90,78 @@ fn sqlite_adapter_rolls_back_and_maps_errors() -> () {
     testing::assert_eq(error.kind, ErrorKind::Backend);
     testing::assert(error.source.is_some());
     testing::assert_ok(database.close());
+}
+
+#[test]
+fn sqlite_adapter_preserves_byte_snapshots_across_value_conversion() -> () {
+    let database = testing::expect_ok(SqliteDriver::new().memory(), "connect");
+    defer {
+        let _ = database.close();
+    };
+    for text in[false, true] {
+        for named in[false, true] {
+            let expected = Vec::from_array([255.to_u8(), 0.to_u8(), 7.to_u8()]);
+            let source = Bytes::from_vec(expected.copy());
+            let value = if text {
+                Value::TextBytes(source)
+            } else {
+                Value::Blob(source)
+            };
+            let statement = query(
+                if named {
+                    "SELECT :v UNION ALL SELECT :v"
+                } else {
+                    "SELECT ?1 UNION ALL SELECT ?1"
+                },
+                if named {
+                    Params::named(Vec::from_array([("v", value)]))
+                } else {
+                    Params::positional(Vec::from_array([value]))
+                },
+            );
+            source.set(0, 42);
+            let exposed = match statement.params() {
+                Params::Named(values) => values[0].1,
+                Params::Positional(values) => values[0],
+            };
+            match exposed {
+                Value::Blob(bytes) | Value::TextBytes(bytes) => bytes.set(0, 43),
+                _ => testing::fail("expected byte parameter"),
+            }
+            let rows: Vec[Row] = testing::expect_ok(database.query_all(statement, 2), "byte rows");
+            testing::assert_eq(rows.len(), 2);
+            for row in rows {
+                let value = testing::expect_ok(row.value(0), "byte value");
+                let bytes = match value {
+                    Value::Blob(bytes) => {
+                        testing::assert(!text);
+                        bytes
+                    },
+                    Value::TextBytes(bytes) => {
+                        testing::assert(text);
+                        bytes
+                    },
+                    _ => {
+                        testing::fail("storage class changed");
+                        Bytes::new()
+                    },
+                };
+                testing::assert(bytes.to_vec() == expected);
+                bytes.set(0, 44);
+                match row.values()[0] {
+                    Value::Blob(bytes) | Value::TextBytes(bytes) => {
+                        testing::assert(bytes.to_vec() == expected);
+                        bytes.set(0, 45);
+                    },
+                    _ => testing::fail("expected row bytes"),
+                }
+                match testing::expect_ok(row.value(0), "row snapshot") {
+                    Value::Blob(bytes) | Value::TextBytes(bytes) => testing::assert(
+                        bytes.to_vec() == expected,
+                    ),
+                    _ => testing::fail("expected row snapshot"),
+                }
+            }
+        }
+    }
 }
