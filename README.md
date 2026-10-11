@@ -122,15 +122,15 @@ retaining a lease beyond the callback a supported usage pattern.
 The module and native downstream fixture use the native SQLite adapter mapping
 and pinned Go dependencies described in the [SQLite README](../sqlite/README.md).
 The root `go.mod` uses the local `../sqlite` replacement; the fixture
-uses `../../../../sqlite` from `testdata/downstream/native`. `(cd ../verification && just ecosystem-test sql)` formats, builds, tests
+uses `../../../../sqlite` from `testdata/downstream/native`. `(cd ../workflows && just ecosystem-test sql)` formats, builds, tests
 and runs the module and fixture through the isolated registry snapshot.
 
 ## Development and downstream checks
 
-Requires the source-built GoML toolchain with unversioned registry support pinned in [verification/ci/toolchain.json](https://github.com/gomlang/verification/blob/main/ci/toolchain.json). The independent native fixture is in `testdata/downstream/native/`; it retains a separate manifest and Go module for native dependencies. From the library root, run:
+Requires the source-built GoML toolchain with unversioned registry support pinned in [workflows/ci/toolchain.json](https://github.com/gomlang/workflows/blob/main/ci/toolchain.json). The independent native fixture is in `testdata/downstream/native/`; it retains a separate manifest and Go module for native dependencies. From the library root, run:
 
 ```sh
 goml test
 ```
 
-The independent downstream fixture has its own manifest and is not included in the root `goml test`. Run `(cd ../verification && just ecosystem-test sql)` to build and test that fixture and run the library-specific smoke and compatibility checks.
+The independent downstream fixture has its own manifest and is not included in the root `goml test`. Run `(cd ../workflows && just ecosystem-test sql)` to build and test that fixture and run the library-specific smoke and compatibility checks.
