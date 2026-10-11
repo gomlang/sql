@@ -2,4 +2,4 @@
 path = "downstream::sql"
 
 [dependencies]
-"ecosystem::sql" = "0.1.0"
+"ecosystem::sql" = true

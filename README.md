@@ -11,8 +11,10 @@ migrations. It reuses the connection and transaction contracts below.
 
 ```toml
 [dependencies]
-"ecosystem::sql" = "0.1.0"
+"ecosystem::sql" = true
 ```
+
+GoML dependencies are unversioned: `true` tracks each package repository’s default branch.
 
 `Driver` opens a `Connection`; `Connection` starts a `Transaction`, and both
 provide the `Executor` methods `execute`, `query`, `query_all`, `query_optional`
@@ -125,11 +127,10 @@ and runs the module and fixture through the isolated registry snapshot.
 
 ## Development and downstream checks
 
-Requires GoML 0.1.56 or newer. The independent native fixture is in `testdata/downstream/native/`; it retains a separate manifest and Go module for native dependencies. From the library root, run:
+Requires the source-built GoML toolchain with unversioned registry support pinned in [verification/ci/toolchain.json](https://github.com/gomlang/verification/blob/main/ci/toolchain.json). The independent native fixture is in `testdata/downstream/native/`; it retains a separate manifest and Go module for native dependencies. From the library root, run:
 
 ```sh
 goml test
-goml verify --timeout 300s
 ```
 
-`goml verify` builds and tests the fixture against an isolated registry snapshot. `(cd ../verification && just ecosystem-test sql)` also runs the library-specific smoke and compatibility checks.
+The independent downstream fixture has its own manifest and is not included in the root `goml test`. Run `(cd ../verification && just ecosystem-test sql)` to build and test that fixture and run the library-specific smoke and compatibility checks.
