@@ -1,0 +1,75 @@
+package sql;
+
+pub trait PreparedStatement {
+    type Cursor: RowCursor;
+    fn execute(self: Self, params: Params) -> Result[Execution, Error];
+    fn query(self: Self, params: Params) -> Result[Self::Cursor, Error];
+    fn close(self: Self) -> Result[(), Error];
+    fn query_all[T: FromRow](self: Self, params: Params, max_rows: isize) -> Result[Vec[T], Error] {
+        if max_rows < 0 || max_rows > 1048576 {
+            return Result::Err(Error::new(ErrorKind::Limit, "invalid result row limit"));
+        }
+        collect_cursor(self.query(params)?, max_rows, Option::None)
+    }
+    fn query_all_with_limits[T: FromRow](self: Self, params: Params, limits: CollectionLimits) -> Result[
+        Vec[T],
+        Error,
+    ] {
+        limits.validate()?;
+        collect_cursor(self.query(params)?, limits.max_rows, Option::Some(limits.max_bytes))
+    }
+    fn query_optional[T: FromRow](self: Self, params: Params) -> Result[Option[T], Error] {
+        with_cursor(
+            self.query(params)?,
+            |rows| {
+                let Some(row) = rows.next()? else {
+                    return Result::Ok(Option::None);
+                };
+                if rows.next()?.is_some() {
+                    return Result::Err(
+                        Error::new(ErrorKind::MultipleRows, "expected at most one result row"),
+                    );
+                }
+                Result::Ok(Option::Some(FromRow::from_row(row)?))
+            },
+        )
+    }
+    fn query_one[T: FromRow](self: Self, params: Params) -> Result[T, Error] {
+        self.query_optional(params)?.ok_or(Error::new(ErrorKind::NoRows, "query returned no rows"))
+    }
+}
+
+pub trait Preparer: Executor {
+    type Statement: PreparedStatement;
+    fn prepare(self: Self, statement: string) -> Result[Self::Statement, Error];
+}
+
+pub fn with_statement[S: PreparedStatement, T](statement: S, callback: (S) -> Result[T, Error]) -> Result[
+    T,
+    Error,
+] {
+    let closed = Ref::new(false);
+    defer {
+        if !closed.get() {
+            let _ = statement.close();
+        }
+    };
+    let result = callback(statement);
+    closed.set(true);
+    let cleanup = statement.close();
+    match result {
+        Ok(value) => {
+            cleanup?;
+            Result::Ok(value)
+        },
+        Err(error) => match cleanup {
+            Ok(()) => Result::Err(error),
+            Err(cleanup) => Result::Err(
+                Error {
+                    message: error.message + "; statement cleanup: " + cleanup.to_string(),
+                    ..error,
+                },
+            ),
+        },
+    }
+}

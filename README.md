@@ -134,3 +134,19 @@ goml test
 ```
 
 The independent downstream fixture has its own manifest and is not included in the root `goml test`. Run `(cd ../workflows && just ecosystem-test sql)` to build and test that fixture and run the library-specific smoke and compatibility checks.
+
+`Preparer: Executor` is an optional extension with an associated
+`Statement: PreparedStatement`. Existing drivers and executors need no changes.
+A statement provides `execute(Params)`, `query(Params)`, explicit `close`, and
+row collection/optional/one helpers with the same limits and cursor cleanup as
+`Executor`. `with_statement(statement, callback)` closes on success, error, or
+panic and preserves a callback error if cleanup also fails.
+
+`SqliteConnection` and `SqliteTransaction` implement `Preparer`, returning
+`SqliteStatement`. Bindings are copied on each execution; statements are reusable
+once their cursor closes. An active cursor makes another execution/query busy.
+Closing a statement is idempotent and invalidates it; transaction completion,
+connection closure, and expired pool leases also invalidate derived handles.
+Pool callbacks must close prepared statements before returning; leaked resources
+use the existing pool discard policy. Preparing is explicit: this adds no hidden
+statement cache and does not change transaction or pool ownership.

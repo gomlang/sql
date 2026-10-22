@@ -1,0 +1,176 @@
+package tests;
+
+use ecosystem::sql;
+use ecosystem::sql::{Preparer, PreparedStatement, Executor, Connection, Transaction, RowCursor, Row, Params, Value, Error, ErrorKind, TransactionMode};
+use ecosystem::sql::sqlite::{SqliteDriver, SqlitePool};
+use std::testing;
+use std::panic;
+use std::bytes::{Bytes};
+
+fn prepared_value[P: Preparer](connection: P, value: i64) -> Result[i64, Error] {
+    sql::with_statement(
+        connection.prepare("SELECT :v + :v")?,
+        |statement| {
+            let row: Row = statement.query_one(
+                Params::named(Vec::from_array([("v", Value::Integer(value))])),
+            )?;
+            row.get(0)
+        },
+    )
+}
+
+#[test]
+fn prepared_contract_reuses_parameters_and_enforces_cursor_and_close_lifetimes() -> () {
+    let connection = testing::expect_ok(SqliteDriver::new().memory(), "connect");
+    defer {
+        let _ = connection.close();
+    };
+    testing::assert_eq(testing::expect_ok(prepared_value(connection, 3), "generic prepare"), 6);
+    let statement = testing::expect_ok(connection.prepare("SELECT ? UNION ALL SELECT ?"), "prepare");
+    for number in 1..4 {
+        let params = Params::positional(
+            Vec::from_array([Value::Integer(number.to_i64()), Value::Integer(7)]),
+        );
+        let rows = testing::expect_ok(statement.query(params), "query");
+        testing::assert_eq(
+            testing::expect_err(statement.query(params), "busy").kind,
+            ErrorKind::Busy,
+        );
+        testing::assert_eq(
+            testing::expect_err(statement.execute(params), "busy execute").kind,
+            ErrorKind::Busy,
+        );
+        let row = testing::expect_some(testing::expect_ok(rows.next(), "next"), "row");
+        testing::assert_eq(testing::expect_ok(row.get::[i64](0), "number"), number.to_i64());
+        testing::assert_ok(rows.close());
+    }
+    testing::assert_ok(statement.close());
+    testing::assert_ok(statement.close());
+    testing::assert_eq(
+        testing::expect_err(statement.query(Params::empty()), "closed").kind,
+        ErrorKind::Closed,
+    );
+    testing::assert_ok(connection.close());
+}
+
+#[test]
+fn prepared_binding_snapshots_and_transaction_end_are_preserved() -> () {
+    let connection = testing::expect_ok(SqliteDriver::new().memory(), "connect");
+    defer {
+        let _ = connection.close();
+    };
+    let statement = testing::expect_ok(connection.prepare("SELECT ?"), "prepare");
+    let blob = Bytes::from_vec(Vec::from_array([1.to_u8(), 2.to_u8()]));
+    let params = Params::positional(Vec::from_array([Value::Blob(blob)]));
+    let rows = testing::expect_ok(statement.query(params), "query");
+    blob.set(0, 9);
+    let row = testing::expect_some(testing::expect_ok(rows.next(), "row"), "row");
+    let bytes: Bytes = testing::expect_ok(row.get(0), "blob");
+    testing::assert(bytes.to_vec() == Vec::from_array([1.to_u8(), 2.to_u8()]));
+    testing::assert_ok(rows.close());
+    testing::assert_ok(statement.close());
+    for commit in Vec::from_array([false, true]) {
+        let tx = testing::expect_ok(connection.begin(TransactionMode::Deferred), "begin");
+        let statement = testing::expect_ok(tx.prepare("SELECT 1"), "transaction prepare");
+        testing::assert_eq(testing::expect_ok(prepared_value(tx, 4), "generic transaction"), 8);
+        if commit {
+            testing::assert_ok(tx.commit());
+        } else {
+            testing::assert_ok(tx.rollback());
+        }
+        testing::assert_eq(
+            testing::expect_err(statement.query(Params::empty()), "ended transaction").kind,
+            ErrorKind::Closed,
+        );
+        testing::assert_ok(statement.close());
+    }
+}
+
+#[test]
+fn prepared_helpers_close_cursors_on_conversion_and_limits() -> () {
+    let connection = testing::expect_ok(SqliteDriver::new().memory(), "connect");
+    defer {
+        let _ = connection.close();
+    };
+    let statement = testing::expect_ok(connection.prepare("SELECT 1 UNION ALL SELECT 2"), "prepare");
+    let one: Result[Row, Error] = statement.query_one(Params::empty());
+    testing::assert_eq(testing::expect_err(one, "multiple").kind, ErrorKind::MultipleRows);
+    let all: Result[Vec[Row], Error] = statement.query_all(Params::empty(), 1);
+    testing::assert_eq(testing::expect_err(all, "limit").kind, ErrorKind::Limit);
+    let rows: Vec[Row] = testing::expect_ok(
+        statement.query_all(Params::empty(), 2),
+        "reuse after helper failure",
+    );
+    testing::assert_eq(rows.len(), 2);
+    testing::assert_ok(statement.close());
+    let statement = testing::expect_ok(connection.prepare("CREATE TABLE t(x)"), "prepare DDL");
+    testing::assert_ok(statement.execute(Params::empty()));
+    testing::assert_ok(statement.close());
+}
+
+#[test]
+fn prepared_pool_leases_and_statement_cleanup_do_not_leak_resources() -> () {
+    let pool = testing::expect_ok(
+        SqlitePool::new(SqliteDriver::new(), ":memory:", sql::PoolPolicy::standard()),
+        "pool",
+    );
+    defer {
+        let _ = pool.close();
+    };
+    let saved = Ref::new(Option::None);
+    let leaked: Result[(), Error] = pool.with_connection(
+        |connection| {
+            saved.set(Option::Some(connection.prepare("SELECT 1")?));
+            Result::Ok(())
+        },
+    );
+    testing::assert_eq(
+        testing::expect_err(leaked, "live statement rejected").kind,
+        ErrorKind::Argument,
+    );
+    let statement = testing::expect_some(saved.get(), "saved");
+    testing::assert_eq(
+        testing::expect_err(statement.query(Params::empty()), "lease expired").kind,
+        ErrorKind::Closed,
+    );
+    testing::assert_eq(pool.stats().open, 0);
+    testing::assert_eq(
+        testing::expect_ok(
+            pool.with_connection(|connection| prepared_value(connection, 5)),
+            "new lease",
+        ),
+        10,
+    );
+    testing::assert_eq(pool.stats().idle, 1);
+    let connection = testing::expect_ok(SqliteDriver::new().memory(), "connection");
+    defer {
+        let _ = connection.close();
+    };
+    let statement = testing::expect_ok(connection.prepare("SELECT 1"), "prepare");
+    let result: Result[(), Error] = sql::with_statement(
+        statement,
+        |_| Result::Err(Error::new(ErrorKind::Argument, "callback")),
+    );
+    testing::assert_eq(testing::expect_err(result, "callback").message, "callback");
+    testing::assert_eq(
+        testing::expect_err(statement.query(Params::empty()), "cleanup").kind,
+        ErrorKind::Closed,
+    );
+    let statement = testing::expect_ok(connection.prepare("SELECT 1"), "prepare panic");
+    let unwind = panic::catch(
+        || {
+            let result: Result[(), Error] = sql::with_statement(
+                statement,
+                |_| {
+                    panic::raise("prepared callback")
+                },
+            );
+            result
+        },
+    );
+    testing::assert(unwind.is_err());
+    testing::assert_eq(
+        testing::expect_err(statement.query(Params::empty()), "panic cleanup").kind,
+        ErrorKind::Closed,
+    );
+}

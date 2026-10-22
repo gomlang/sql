@@ -1,0 +1,74 @@
+package sqlite;
+
+use ecosystem::sql;
+use ecosystem::sql::{Error, Params, Execution};
+use ecosystem::sqlite as native;
+
+pub struct SqliteStatement {
+    statement: native::Statement,
+    lease: Option[LeaseState],
+}
+
+impl sql::Preparer for SqliteConnection {
+    type Statement = SqliteStatement;
+
+    fn prepare(self: SqliteConnection, statement: string) -> Result[SqliteStatement, Error] {
+        enter_lease(self.lease)?;
+        defer leave_lease(self.lease);
+        Result::Ok(
+            SqliteStatement {
+                statement: native::Executor::prepare(self.database, statement).map_err(
+                    convert_error,
+                )?,
+                lease: self.lease,
+            },
+        )
+    }
+}
+
+impl sql::Preparer for SqliteTransaction {
+    type Statement = SqliteStatement;
+
+    fn prepare(self: SqliteTransaction, statement: string) -> Result[SqliteStatement, Error] {
+        enter_lease(self.lease)?;
+        defer leave_lease(self.lease);
+        Result::Ok(
+            SqliteStatement {
+                statement: native::Executor::prepare(self.transaction, statement).map_err(
+                    convert_error,
+                )?,
+                lease: self.lease,
+            },
+        )
+    }
+}
+
+impl sql::PreparedStatement for SqliteStatement {
+    type Cursor = SqliteRows;
+
+    fn execute(self: SqliteStatement, params: Params) -> Result[Execution, Error] {
+        enter_lease(self.lease)?;
+        defer leave_lease(self.lease);
+        let result = self.statement.execute(native_params(params)).map_err(convert_error)?;
+        Result::Ok(
+            Execution { rows_affected: result.rows_affected, last_insert_id: result.last_insert_id },
+        )
+    }
+
+    fn query(self: SqliteStatement, params: Params) -> Result[SqliteRows, Error] {
+        enter_lease(self.lease)?;
+        defer leave_lease(self.lease);
+        Result::Ok(
+            SqliteRows {
+                rows: self.statement.query(native_params(params)).map_err(convert_error)?,
+                lease: self.lease,
+            },
+        )
+    }
+
+    fn close(self: SqliteStatement) -> Result[(), Error] {
+        enter_lease(self.lease)?;
+        defer leave_lease(self.lease);
+        self.statement.close().map_err(convert_error)
+    }
+}
